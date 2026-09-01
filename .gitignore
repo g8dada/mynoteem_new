@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Generated training data (large, reproducible by running preprocessing)
+data/
+logs/
+
+# Training run outputs (large checkpoints and MIDI alignments)
+runs/
+
+# Model checkpoint weights (large binary files — download links are in ckpts/checkpoint_links.txt)
+ckpts/*.pt
+
+# Claude Code local settings (machine-specific)
+.claude/settings.local.json
+
+# OS junk
+.DS_Store
+Thumbs.db
