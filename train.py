@@ -26,7 +26,10 @@ ex = Experiment('train_transcriber')
 @ex.config
 def config():
     logdir = 'runs/transcriber-' + datetime.now().strftime('%y%m%d-%H%M%S') # ckpts and midi will be saved here
-    transcriber_ckpt = 'ckpts/model_64.pt'
+    adapter_mode = False  # Set True to use EffNetb0 (AST) as the EM backbone instead of OnsetsAndFrames
+    transcriber_ckpt = '/data/hakka/singing_transcription_ICASSP2021/AST/models/1005_e_4' if adapter_mode else 'ckpts/model_64.pt'
+    # When adapter_mode=True, override transcriber_ckpt with the AST checkpoint, e.g.:
+    #   transcriber_ckpt = '/data/hakka/singing_transcription_ICASSP2021/AST/models/1005_e_4'
     multi_ckpt = False # Flag if the ckpt was trained on pitch only or instrument-sensitive. The provided checkpoints were trained on pitch only.
     visualize = True  # save piano-roll PNGs and notes_log.json each epoch
     gt_json_path = '/data/hakka/singing_transcription_ICASSP2021/MIR-ST500_20210206/MIR-ST500_corrected.json'
@@ -50,7 +53,7 @@ def config():
 
 @ex.automain
 def train(logdir, device, iterations, checkpoint_interval, batch_size, sequence_length, learning_rate, learning_rate_decay_steps,
-          clip_gradient_norm, epochs, transcriber_ckpt, multi_ckpt, visualize, gt_json_path):
+          clip_gradient_norm, epochs, transcriber_ckpt, multi_ckpt, adapter_mode, visualize, gt_json_path):
 
     print_config(ex.current_run)
     os.makedirs(logdir, exist_ok=True)
@@ -75,7 +78,8 @@ def train(logdir, device, iterations, checkpoint_interval, batch_size, sequence_
         notes_json_path = None
 
     conversion_map = None
-    instrument_map = None
+    # adapter_mode uses pitch-only (no instrument channels) — force empty instrument map
+    instrument_map = [] if adapter_mode else None
     dataset = EMDATASET(audio_path=train_data_path,
                            labels_path=labels_path,
                            groups=train_groups,
@@ -88,7 +92,19 @@ def train(logdir, device, iterations, checkpoint_interval, batch_size, sequence_
     print('len dataset', len(dataset), len(dataset.data))
 
     #####
-    if not multi_ckpt:
+    if adapter_mode:
+        from onsets_and_frames.ast_model import EffNetb0
+        from onsets_and_frames.transcriber import AMTAdapter
+        backbone = EffNetb0()
+        backbone.load_state_dict(
+            torch.load(transcriber_ckpt, map_location='cpu', weights_only=False),
+            strict=False,
+        )
+        transcriber = AMTAdapter(backbone).to(device)
+        # Freeze the early encoder blocks; keep later blocks and classifier trainable.
+        set_diff(transcriber.backbone.effnet.conv_stem, False)
+        set_diff(transcriber.backbone.effnet.blocks[:4], False)
+    elif not multi_ckpt:
         model_complexity = 64 if '64' in transcriber_ckpt else 48
         saved_transcriber = torch.load(transcriber_ckpt).cpu()
         # We create a new transcriber with N_KEYS classes for each instrument:
@@ -101,12 +117,13 @@ def train(logdir, device, iterations, checkpoint_interval, batch_size, sequence_
         # The checkpoint is already instrument-sensitive
         transcriber = torch.load(transcriber_ckpt).to(device)
 
-    # We recommend to train first only onset detection. This will already give good note durations because the combined stack receives
-    # information from the onset stack
-    set_diff(transcriber.frame_stack, False)
-    set_diff(transcriber.offset_stack, False)
-    set_diff(transcriber.combined_stack, False)
-    set_diff(transcriber.velocity_stack, False)
+    if not adapter_mode:
+        # We recommend to train first only onset detection. This will already give good note durations because the combined stack receives
+        # information from the onset stack
+        set_diff(transcriber.frame_stack, False)
+        set_diff(transcriber.offset_stack, False)
+        set_diff(transcriber.combined_stack, False)
+        set_diff(transcriber.velocity_stack, False)
 
     parallel_transcriber = DataParallel(transcriber, device_ids=[0])
     optimizer = torch.optim.Adam(list(transcriber.parameters()), lr=learning_rate, weight_decay=1e-5)
@@ -153,12 +170,13 @@ def train(logdir, device, iterations, checkpoint_interval, batch_size, sequence_
             batch = next(curr_loader)
             optimizer.zero_grad()
 
-            n_weight = 1 if HOP_LENGTH == 512 else 2
+            n_weight = 10 if adapter_mode else (1 if HOP_LENGTH == 512 else 2)
             transcription, transcription_losses = transcriber.run_on_batch(batch, parallel_transcriber,
                                                                            positive_weight=n_weight,
                                                                            inv_positive_weight=n_weight,
                                                                            )
-            onset_pred = transcription['onset'].detach() > 0.5
+            onset_threshold = 0.05 if adapter_mode else 0.5
+            onset_pred = transcription['onset'].detach() > onset_threshold
             onset_total_pp += onset_pred
             onset_tp = onset_pred * batch['onset'].detach()
             onset_total_tp += onset_tp
@@ -172,7 +190,10 @@ def train(logdir, device, iterations, checkpoint_interval, batch_size, sequence_
 
             transcription_loss = sum(transcription_losses.values())
             loss = transcription_loss
-            loss.backward()
+            # AMTAdapter.run_on_batch calls backward() per clip internally;
+            # returned losses are detached scalars, so grad_fn is None.
+            if loss.grad_fn is not None:
+                loss.backward()
 
             if clip_gradient_norm:
                 clip_grad_norm_(transcriber.parameters(), clip_gradient_norm)
@@ -182,7 +203,7 @@ def train(logdir, device, iterations, checkpoint_interval, batch_size, sequence_
             print('loss:', sum(total_loss) / len(total_loss), 'Onset Precision:', onset_precision, 'Onset Recall', onset_recall,
                                                             'Pitch Onset Precision:', pitch_onset_precision, 'Pitch Onset Recall', pitch_onset_recall)
 
-        save_condition = epoch % checkpoint_interval == 1
+        save_condition = epoch % checkpoint_interval == 0
         if save_condition:
             torch.save(transcriber, os.path.join(logdir, 'transcriber_{}.pt'.format(epoch)))
             torch.save(optimizer.state_dict(), os.path.join(logdir, 'last-optimizer-state.pt'))

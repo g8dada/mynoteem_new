@@ -35,14 +35,16 @@ def midi_to_frames(midi, instruments, conversion_map=None):
         frame_right = int(round(offset * SAMPLE_RATE / HOP_LENGTH))
         frame_right = min(n_steps, frame_right)
         offset_right = min(n_steps, frame_right + HOPS_IN_OFFSET)
-        if int(instrument) not in instruments:
-            continue
-        chan = instruments.index(int(instrument))
-        label[left:onset_right, n_keys * chan + f] = 3
-        label[onset_right:frame_right, n_keys * chan + f] = 2
-        label[frame_right:offset_right, n_keys * chan + f] = 1
-
         inv_chan = len(instruments)
+        if int(instrument) in instruments:
+            chan = instruments.index(int(instrument))
+            label[left:onset_right, n_keys * chan + f] = 3
+            label[onset_right:frame_right, n_keys * chan + f] = 2
+            label[frame_right:offset_right, n_keys * chan + f] = 1
+        elif instruments:
+            # note's instrument not in the tracked list; skip pitch-only channel too
+            continue
+
         label[left:onset_right, n_keys * inv_chan + f] = 3
         label[onset_right:frame_right, n_keys * inv_chan + f] = 2
         label[frame_right:offset_right, n_keys * inv_chan + f] = 1

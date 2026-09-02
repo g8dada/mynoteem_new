@@ -16,6 +16,7 @@ from datetime import datetime
 from onsets_and_frames.midi_utils import *
 from onsets_and_frames.utils import *
 import time
+import librosa
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -88,6 +89,22 @@ def _visualize_notes(viz_dir, seg_key, history):
     plt.savefig(out, dpi=100, bbox_inches='tight')
     plt.close(fig)
     print(f'Saved viz: {out}')
+
+
+def _compute_cqt(audio_short):
+    """Resample ShortTensor audio (16 kHz) and compute CQT for AMTAdapter caching."""
+    audio_np = audio_short.float().numpy() / 32768.0
+    audio_44k = librosa.resample(audio_np, orig_sr=SAMPLE_RATE, target_sr=44100)
+    fmin = librosa.midi_to_hz(36)  # MIDI_LOW = 36
+    cqt_mag = np.abs(librosa.cqt(
+        audio_44k, sr=44100, hop_length=1024,
+        fmin=fmin, n_bins=168, bins_per_octave=24,
+    ))
+    return torch.from_numpy(cqt_mag).float()  # (168, T_cqt)
+
+
+# CQT frame-rate conversion factor: (44100 Hz / 1024 hop) / 16000 Hz
+_CQT_RATIO = 44100 / (SAMPLE_RATE * 1024)  # ≈ 0.002693 CQT frames per 16 kHz sample
 
 
 class EMDATASET(Dataset):
@@ -192,6 +209,17 @@ class EMDATASET(Dataset):
         diff = self.sequence_length - len(result['audio'])
         result['audio'] = torch.cat((result['audio'], torch.zeros(diff, dtype=result['audio'].dtype)))
         result['audio'] = result['audio'].to(self.device)
+
+        if 'cqt' in data:
+            _cqt_full = data['cqt']                          # (168, T_cqt_full)
+            _cqt_start = int(begin * _CQT_RATIO)
+            _cqt_len = int(self.sequence_length * _CQT_RATIO) + 2  # fixed size, +2 safety
+            _cqt_end = _cqt_start + _cqt_len
+            _slice = _cqt_full[:, _cqt_start:min(_cqt_end, _cqt_full.shape[1])]
+            _right_pad = _cqt_len - _slice.shape[1]
+            if _right_pad > 0:
+                _slice = torch.nn.functional.pad(_slice, (0, _right_pad))
+            result['cqt'] = _slice.to(self.device)           # (168, _cqt_len)
         result['label'] = data['label'][step_begin:step_end, ...]
         label_len = result['label'].shape[0]
         if label_len < n_steps:
@@ -264,6 +292,8 @@ class EMDATASET(Dataset):
             res['label'] = shift_label(self.pts[orig]['label'], int(shift))
             res['path'] = audio_path
             res['audio'] = data['audio']
+            if 'cqt' in data:
+                res['cqt'] = data['cqt']
             if 'velocity' in self.pts[orig]:
                 res['velocity'] = shift_label(self.pts[orig]['velocity'], int(shift))
             if 'onset_mask' in self.pts[orig]:
@@ -277,11 +307,32 @@ class EMDATASET(Dataset):
         print('loading pts...')
         for flac, tsv in tqdm(files):
             print('flac, tsv', flac, tsv)
-            if os.path.isfile(self.labels_path + '/' +
-                              flac.split('/')[-1].replace('.flac', '.pt')):
-                self.pts[flac] = torch.load(self.labels_path + '/' +
-                              flac.split('/')[-1].replace('.flac', '.pt'))
-            else:
+            _cache_path = self.labels_path + '/' + flac.split('/')[-1].replace('.flac', '.pt')
+            _cache_valid = False
+            _adapter_mode = len(self.instruments) == 0
+            if os.path.isfile(_cache_path):
+                _cached = torch.load(_cache_path, weights_only=False)
+                _needs_cqt = _adapter_mode and 'cqt' not in _cached
+                if 'unaligned_label' in _cached:
+                    _expected_cols = (len(self.instruments) + 1) * N_KEYS
+                    if _cached['unaligned_label'].shape[-1] != _expected_cols:
+                        print(f'Cache column mismatch for {flac}: '
+                              f'{_cached["unaligned_label"].shape[-1]} vs {_expected_cols}, regenerating.')
+                        os.remove(_cache_path)
+                    elif _needs_cqt:
+                        print(f'Cache missing CQT for {flac}, regenerating.')
+                        os.remove(_cache_path)
+                    else:
+                        self.pts[flac] = _cached
+                        _cache_valid = True
+                else:
+                    if _needs_cqt:
+                        print(f'Cache missing CQT for {flac}, regenerating.')
+                        os.remove(_cache_path)
+                    else:
+                        self.pts[flac] = _cached
+                        _cache_valid = True
+            if not _cache_valid:
                 if flac.count('#') != 2:
                     print('two #', flac)
                 audio, sr = soundfile.read(flac, dtype='int16')
@@ -296,6 +347,8 @@ class EMDATASET(Dataset):
                 if '#0' not in flac:
                     assert '#' in flac
                     data = {'audio': audio}
+                    if _adapter_mode:
+                        data['cqt'] = _compute_cqt(audio)
                     self.pts[flac] = data
                     torch.save(data,
                                self.labels_path + '/' + flac.split('/')[-1]
@@ -305,6 +358,8 @@ class EMDATASET(Dataset):
                 unaligned_label = midi_to_frames(midi, self.instruments, conversion_map=self.conversion_map)
                 data = dict(path=self.labels_path + '/' + flac.split('/')[-1],
                             audio=audio, unaligned_label=unaligned_label)
+                if _adapter_mode:
+                    data['cqt'] = _compute_cqt(audio)
                 torch.save(data, self.labels_path + '/' + flac.split('/')[-1]
                                .replace('.flac', '.pt').replace('.mp3', '.pt'))
                 self.pts[flac] = data
@@ -334,6 +389,14 @@ class EMDATASET(Dataset):
                     _gt_data = json.load(f)
             except Exception as e:
                 print(f'Warning: could not load GT JSON: {e}')
+
+        # Detect whether the transcriber is an AMTAdapter so we can pass raw audio
+        # instead of a pre-computed mel spectrogram.
+        from onsets_and_frames.transcriber import AMTAdapter
+        from torch.nn import DataParallel
+        _inner = transcriber.module if isinstance(transcriber, DataParallel) else transcriber
+        _is_adapter = isinstance(_inner, AMTAdapter)
+
         print('there are', len(self.pts), 'pts')
         for flac, data in self.pts.items():
             if 'unaligned_label' not in data:
@@ -351,8 +414,11 @@ class EMDATASET(Dataset):
                 vel_preds = []
                 for i_s in range(n_segments):
                     curr = audio_inp[i_s * seg_len: (i_s + 1) * seg_len].unsqueeze(0).cuda()
-                    curr_mel = melspectrogram(curr.reshape(-1, curr.shape[-1])[:, :-1]).transpose(-1, -2)
-                    curr_onset_pred, curr_offset_pred, _, curr_frame_pred, curr_velocity_pred = transcriber(curr_mel)
+                    if _is_adapter:
+                        curr_onset_pred, curr_offset_pred, _, curr_frame_pred, curr_velocity_pred = transcriber(curr)
+                    else:
+                        curr_mel = melspectrogram(curr.reshape(-1, curr.shape[-1])[:, :-1]).transpose(-1, -2)
+                        curr_onset_pred, curr_offset_pred, _, curr_frame_pred, curr_velocity_pred = transcriber(curr_mel)
                     onsets_preds.append(curr_onset_pred)
                     offset_preds.append(curr_offset_pred)
                     frame_preds.append(curr_frame_pred)
@@ -363,8 +429,13 @@ class EMDATASET(Dataset):
                 velocity_pred = torch.cat(vel_preds, dim=1)
             else:
                 audio_inp = audio_inp.unsqueeze(0).cuda()
-                mel = melspectrogram(audio_inp.reshape(-1, audio_inp.shape[-1])[:, :-1]).transpose(-1, -2)
-                onset_pred, offset_pred, _, frame_pred, velocity_pred = transcriber(mel)
+                if _is_adapter:
+                    _cqt = data.get('cqt')
+                    _cqt_inp = _cqt.unsqueeze(0).cuda() if _cqt is not None else None
+                    onset_pred, offset_pred, _, frame_pred, velocity_pred = transcriber(audio_inp, _cqt_inp)
+                else:
+                    mel = melspectrogram(audio_inp.reshape(-1, audio_inp.shape[-1])[:, :-1]).transpose(-1, -2)
+                    onset_pred, offset_pred, _, frame_pred, velocity_pred = transcriber(mel)
             print('done predicting.')
             # We assume onset predictions are of length N_KEYS * (len(instruments) + 1),
             # first N_KEYS classes are the first instrument, next N_KEYS classes are the next instrument, etc.,
