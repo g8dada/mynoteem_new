@@ -12,7 +12,10 @@ Each song is split with a 15-second hop. For each segment:
 
 Notes are assigned by onset only; audio extends dynamically to capture their real offsets.
 No note appears in two segments' TSVs. Segments with no notes are skipped entirely.
-Within each segment TSV, notes are assigned uniform 0.5s synthetic slots (unaligned paradigm).
+Within each segment TSV, note durations are ceiling-quantized to 0.5s steps
+(≤0.5s→0.5s, 0.5–1s→1s, 1–1.5s→1.5s, …) and placed sequentially.
+This preserves coarse long/short distinctions for the EM offset-scaling step
+while staying on a 0.5s grid (unaligned paradigm).
 
 Usage:
     python preprocess_mirst500.py [--limit N] [--workers W]
@@ -31,6 +34,7 @@ Copy the list printed at the end of this script.
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -41,7 +45,7 @@ from tqdm import tqdm
 
 JSON_PATH = '../singing_transcription_ICASSP2021/MIR-ST500_20210206/MIR-ST500_corrected.json'
 TRAIN_DIR = '../singing_transcription_ICASSP2021/test'
-data_name = 'mirst500_15sec_5_data'
+data_name = 'mirst500_15sec_data_full_quantized'
 AUDIO_OUT = f'data/{data_name}_NoteEM_audio'
 TSV_OUT = f'data/{data_name}_NoteEM_tsv'
 
@@ -116,10 +120,15 @@ def make_tsv(sid, seg_idx, group, notes_json, start_sec, end_sec, is_last):
     os.makedirs(tsv_dir, exist_ok=True)
 
     rows = []
-    for i, (_, _, midi_note) in enumerate(notes_sorted):
-        onset = i * NOTE_DURATION
-        offset = onset + NOTE_DURATION - 0.01
+    cumulative = 0.0
+    for real_onset, real_offset, midi_note in notes_sorted:
+        real_dur = real_offset - real_onset
+        quantized_dur = max(NOTE_DURATION,
+                            math.ceil(real_dur / NOTE_DURATION) * NOTE_DURATION)
+        onset = cumulative
+        offset = cumulative + quantized_dur - 0.01
         rows.append((onset, offset, float(midi_note), VELOCITY, INSTRUMENT))
+        cumulative += quantized_dur
 
     arr = np.array(rows, dtype=float)
     np.savetxt(tsv_path, arr, fmt='%1.6f', delimiter='\t',

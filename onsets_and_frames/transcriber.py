@@ -239,6 +239,13 @@ class AMTAdapter(nn.Module):
         self.combined_stack = nn.Identity()
         self.velocity_stack = nn.Identity()
 
+        # Precomputed pitch index arrays for vectorised _per_pitch_probs.
+        # Covers MIDI 36–83 (48 pitches); each array has shape (48,).
+        _midis = torch.arange(self._MIDI_LOW, self._MIDI_HIGH + 1)
+        self.register_buffer('_key_idxs', (_midis - MIN_MIDI).long())
+        self.register_buffer('_oct_idxs', ((_midis - self._MIDI_LOW) // 12).long())
+        self.register_buffer('_cls_idxs', (_midis % 12).long())
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -291,23 +298,20 @@ class AMTAdapter(nn.Module):
         Pitches outside MIDI 36-83 remain zero.
         """
         T = onset_logits.shape[0]
-        onset_sig = torch.sigmoid(onset_logits)    # (T,)
-        offset_sig = torch.sigmoid(offset_logits)  # (T,)
+        device = onset_logits.device
+        onset_sig = torch.sigmoid(onset_logits)        # (T,)
+        offset_sig = torch.sigmoid(offset_logits)      # (T,)
         oct_probs = torch.softmax(oct_logits, dim=-1)  # (T, 5)
         cls_probs = torch.softmax(cls_logits, dim=-1)  # (T, 13)
 
-        onset_pp = torch.zeros(T, N_KEYS, device=onset_logits.device)
-        frame_pp = torch.zeros(T, N_KEYS, device=onset_logits.device)
+        # Vectorised: pitch_p[t, i] = P(oct_of_midi_i | t) * P(cls_of_midi_i | t)  (T, 48)
+        pitch_p = oct_probs[:, self._oct_idxs] * cls_probs[:, self._cls_idxs]
 
-        for midi in range(self._MIDI_LOW, self._MIDI_HIGH + 1):
-            key_idx = midi - MIN_MIDI                  # index in 88-key space (0-87)
-            oct_idx = (midi - self._MIDI_LOW) // 12   # 0-3
-            cls_idx = midi % 12                        # 0-11
-            pitch_p = oct_probs[:, oct_idx] * cls_probs[:, cls_idx]  # (T,)
-            onset_pp[:, key_idx] = onset_sig * pitch_p
-            frame_pp[:, key_idx] = pitch_p
+        onset_pp = torch.zeros(T, N_KEYS, device=device)
+        frame_pp = torch.zeros(T, N_KEYS, device=device)
+        onset_pp[:, self._key_idxs] = onset_sig.unsqueeze(-1) * pitch_p
+        frame_pp[:, self._key_idxs] = pitch_p
 
-        # Offset: scalar per frame, broadcast across all pitches
         offset_pp = offset_sig.unsqueeze(-1).expand(T, N_KEYS).clone()
         return onset_pp, frame_pp, offset_pp
 
@@ -319,7 +323,8 @@ class AMTAdapter(nn.Module):
         """Run the adapter forward pass.
 
         audio : (B, L) or (L,) float tensor at 16 kHz, range [-1, 1]
-        cqt   : (B, 168, T_cqt) optional pre-computed CQT (skips resample+CQT when set)
+        cqt   : (B, 168, T_cqt) tensor OR a list/tuple of per-clip (168, T_cqt_i) tensors.
+                If None, CQT is computed from audio on the fly (slow).
 
         Returns 5-tuple matching OnsetsAndFrames.forward() output shapes:
             onset_pred    : (B, T_mel, N_KEYS)
@@ -328,48 +333,68 @@ class AMTAdapter(nn.Module):
             frame_pred    : (B, T_mel, N_KEYS)
             velocity_pred : (B, T_mel, N_KEYS)  — zeros (AST has no velocity output)
 
-        T_mel is computed to match the mel-spectrogram frame count for the same audio,
-        ensuring pseudo-label shapes from the dataset are compatible.
+        Speedup vs. the original per-clip loop:
+          • All clips' CQT windows are concatenated into one tensor and processed in a
+            single pass through the backbone (chunk=128), so GPU kernel launches scale
+            with total_windows / 128 rather than B * T_cqt / 32.
+          • Results are bit-identical in eval mode (BatchNorm uses running stats).
         """
         if audio.dim() == 1:
             audio = audio.unsqueeze(0)
         B, L = audio.shape
         T_mel = (L - 1) // HOP_LENGTH + 1
 
-        onset_list, frame_list, offset_list = [], [], []
+        # Normalise cqt into a per-clip list regardless of how it was passed.
+        if isinstance(cqt, (list, tuple)):
+            cqt_per_clip = cqt
+        elif cqt is not None:
+            cqt_per_clip = [cqt[b] for b in range(B)]
+        else:
+            cqt_per_clip = [None] * B
+
+        # Build windows for every clip and concatenate for one batched GPU pass.
+        all_windows = []
+        clip_t_cqts = []
         for b in range(B):
-            cqt_b = cqt[b] if cqt is not None else None
-            windows = self._audio_to_windows(audio[b], cqt=cqt_b)  # (T_cqt, 1, 11, 168)
+            w = self._audio_to_windows(audio[b], cqt=cqt_per_clip[b])  # (T_cqt_b, 1, 11, 168)
+            all_windows.append(w)
+            clip_t_cqts.append(w.shape[0])
 
-            # Process in chunks to avoid OOM on long clips
-            _chunk = 32
-            o_chunks, of_chunks, oct_chunks, cls_chunks = [], [], [], []
-            for _i in range(0, windows.shape[0], _chunk):
-                _w = windows[_i:_i + _chunk]
-                _o, _of, _oct, _cls = self.backbone(_w)
-                o_chunks.append(_o); of_chunks.append(_of)
-                oct_chunks.append(_oct); cls_chunks.append(_cls)
-            o_log   = torch.cat(o_chunks)
-            of_log  = torch.cat(of_chunks)
-            oct_log = torch.cat(oct_chunks)
-            cls_log = torch.cat(cls_chunks)
+        stacked = torch.cat(all_windows, dim=0)  # (sum_T_cqt, 1, 11, 168)
+
+        _chunk = 128  # larger chunk → fewer kernel launches; results unchanged in eval mode
+        o_chunks, of_chunks, oct_chunks, cls_chunks = [], [], [], []
+        for _i in range(0, stacked.shape[0], _chunk):
+            _w = stacked[_i:_i + _chunk]
+            _o, _of, _oct, _cls = self.backbone(_w)
+            o_chunks.append(_o); of_chunks.append(_of)
+            oct_chunks.append(_oct); cls_chunks.append(_cls)
+
+        o_all   = torch.cat(o_chunks)    # (sum_T_cqt,)
+        of_all  = torch.cat(of_chunks)   # (sum_T_cqt,)
+        oct_all = torch.cat(oct_chunks)  # (sum_T_cqt, 5)
+        cls_all = torch.cat(cls_chunks)  # (sum_T_cqt, 13)
+
+        def _interp(x):
+            return F.interpolate(
+                x.T.unsqueeze(0), size=T_mel, mode='linear', align_corners=False
+            ).squeeze(0).T  # (T_mel, N_KEYS)
+
+        onset_list, frame_list, offset_list = [], [], []
+        start = 0
+        for t_cqt in clip_t_cqts:
+            end = start + t_cqt
             onset_pp, frame_pp, offset_pp = self._per_pitch_probs(
-                o_log, of_log, oct_log, cls_log
-            )  # each (T_cqt, N_KEYS)
-
-            # Resample time axis from CQT rate to mel rate — differentiable via F.interpolate
-            def _interp(x):
-                # x: (T_cqt, N_KEYS) → treat pitch as channel dim for 1-D interpolation
-                return F.interpolate(
-                    x.T.unsqueeze(0), size=T_mel, mode='linear', align_corners=False
-                ).squeeze(0).T  # (T_mel, N_KEYS)
-
+                o_all[start:end], of_all[start:end],
+                oct_all[start:end], cls_all[start:end],
+            )
             onset_list.append(_interp(onset_pp))
             frame_list.append(_interp(frame_pp))
             offset_list.append(_interp(offset_pp))
+            start = end
 
-        onset_pred = torch.stack(onset_list)   # (B, T_mel, N_KEYS)
-        frame_pred = torch.stack(frame_list)
+        onset_pred  = torch.stack(onset_list)   # (B, T_mel, N_KEYS)
+        frame_pred  = torch.stack(frame_list)
         offset_pred = torch.stack(offset_list)
         velocity_pred = torch.zeros_like(onset_pred)
 

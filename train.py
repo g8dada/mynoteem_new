@@ -15,9 +15,8 @@ from onsets_and_frames.transcriber import load_weights
 
 
 def set_diff(model, diff=True):
-    for layer in model.children():
-        for p in layer.parameters():
-            p.requires_grad = diff
+    for p in model.parameters():
+        p.requires_grad = diff
 
 
 ex = Experiment('train_transcriber')
@@ -42,8 +41,8 @@ def config():
     batch_size = 8
     sequence_length = SEQ_LEN #if HOP_LENGTH == 512 else 3 * SEQ_LEN // 4
 
-    iterations = 1000 # per epoch
-    learning_rate = 0.0001
+    iterations = 1592 # per epoch, 1000 initially
+    learning_rate = 0.00001
     learning_rate_decay_steps = 10000
     clip_gradient_norm = False #3
     epochs = 15
@@ -58,8 +57,9 @@ def train(logdir, device, iterations, checkpoint_interval, batch_size, sequence_
     print_config(ex.current_run)
     os.makedirs(logdir, exist_ok=True)
     
-    train_data_path = '/data/hakka/mynoteem_new/data/mirst500_15sec_5_data_NoteEM_audio'
-    labels_path = '/data/hakka/mynoteem_new/data/mirst500_15sec_5_data_NoteEM_tsv'
+    data_name = 'mirst500_15sec_data_full_quantized'
+    train_data_path = f'/data/hakka/mynoteem_new/data/{data_name}_NoteEM_audio'
+    labels_path = f'/data/hakka/mynoteem_new/data/{data_name}_NoteEM_tsv'
 
     os.makedirs(labels_path, exist_ok=True)
 
@@ -146,7 +146,7 @@ def train(logdir, device, iterations, checkpoint_interval, batch_size, sequence_
                                to_save=logdir + '/alignments',
                                first=epoch == 1,
                                update=True,
-                               BEST_BON=epoch > 5,
+                               BEST_BON=epoch > 1,
                                viz_dir=viz_dir,
                                viz_keys=viz_keys,
                                viz_tag=f'epoch{epoch:02d}',

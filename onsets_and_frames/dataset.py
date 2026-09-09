@@ -103,6 +103,31 @@ def _compute_cqt(audio_short):
     return torch.from_numpy(cqt_mag).float()  # (168, T_cqt)
 
 
+def _precompute_pt(args):
+    """Worker function (module-level for pickling) that computes and saves one .pt cache.
+
+    Called in parallel by load_pts when cache files are missing.  Only handles
+    adapter-mode (instruments=[]) because that is the only case that needs the
+    expensive librosa CQT.  Idempotent: skips files that already exist.
+    """
+    flac, tsv, cache_path, is_zero, conversion_map = args
+    if os.path.isfile(cache_path):
+        return  # another worker finished it first
+    try:
+        audio_raw, sr = soundfile.read(flac, dtype='int16')
+        if len(audio_raw.shape) == 2:
+            audio_raw = audio_raw.astype(float).mean(axis=1).astype(np.int16)
+        audio_t = torch.ShortTensor(audio_raw)
+        data = {'audio': audio_t, 'cqt': _compute_cqt(audio_t)}
+        if is_zero:
+            midi = np.loadtxt(tsv, delimiter='\t', skiprows=1, ndmin=2)
+            data['unaligned_label'] = midi_to_frames(midi, [], conversion_map=conversion_map)
+            data['path'] = cache_path.replace('.pt', '.flac')
+        torch.save(data, cache_path)
+    except Exception as exc:
+        print(f'Warning: _precompute_pt failed for {flac}: {exc}')
+
+
 # CQT frame-rate conversion factor: (44100 Hz / 1024 hop) / 16000 Hz
 _CQT_RATIO = 44100 / (SAMPLE_RATE * 1024)  # ≈ 0.002693 CQT frames per 16 kHz sample
 
@@ -210,7 +235,7 @@ class EMDATASET(Dataset):
         result['audio'] = torch.cat((result['audio'], torch.zeros(diff, dtype=result['audio'].dtype)))
         result['audio'] = result['audio'].to(self.device)
 
-        if 'cqt' in data:
+        if len(self.instruments) == 0 and 'cqt' in data:
             _cqt_full = data['cqt']                          # (168, T_cqt_full)
             _cqt_start = int(begin * _CQT_RATIO)
             _cqt_len = int(self.sequence_length * _CQT_RATIO) + 2  # fixed size, +2 safety
@@ -304,6 +329,30 @@ class EMDATASET(Dataset):
 
     def load_pts(self, files):
         self.pts = {}
+        _adapter_mode = len(self.instruments) == 0
+
+        # --- Parallel CQT pre-computation (adapter mode only, first run) -------
+        # For clips that have no .pt cache yet, compute CQT (and MIDI labels for
+        # #0 clips) in parallel across CPU cores.  Subsequent calls hit the cache
+        # immediately.  Results are identical to sequential computation.
+        if _adapter_mode:
+            _todo = []
+            for flac, tsv in files:
+                _cp = self.labels_path + '/' + flac.split('/')[-1].replace('.flac', '.pt')
+                if not os.path.isfile(_cp):
+                    _todo.append((flac, tsv, _cp, '#0' in flac, self.conversion_map))
+            if _todo:
+                import multiprocessing
+                from concurrent.futures import ThreadPoolExecutor
+                _n_workers = min(max(1, multiprocessing.cpu_count() - 1), 8)
+                print(f'Pre-computing {len(_todo)} missing .pt caches '
+                      f'({_n_workers} workers)...')
+                with ThreadPoolExecutor(max_workers=_n_workers) as _exe:
+                    list(tqdm(_exe.map(_precompute_pt, _todo), total=len(_todo),
+                               desc='CQT cache'))
+                print('CQT pre-computation complete.')
+        # -----------------------------------------------------------------------
+
         print('loading pts...')
         for flac, tsv in tqdm(files):
             print('flac, tsv', flac, tsv)
@@ -323,6 +372,8 @@ class EMDATASET(Dataset):
                         print(f'Cache missing CQT for {flac}, regenerating.')
                         os.remove(_cache_path)
                     else:
+                        if 'path' not in _cached:
+                            _cached['path'] = _cache_path.replace('.pt', '.flac')
                         self.pts[flac] = _cached
                         _cache_valid = True
                 else:
@@ -397,46 +448,103 @@ class EMDATASET(Dataset):
         _inner = transcriber.module if isinstance(transcriber, DataParallel) else transcriber
         _is_adapter = isinstance(_inner, AMTAdapter)
 
+        # --- Batched GPU inference for adapter E-step -------------------------
+        # Pre-compute onset/frame predictions for all #0 clips in mini-batches,
+        # then do the CPU-heavy DTW alignment sequentially below.  Results are
+        # bit-identical to the original per-clip loop (eval mode, no_grad).
+        _pred_cache = {}  # {flac: (onset_cpu (T,88), frame_cpu (T,88))}
+        if _is_adapter:
+            _pts_list = [(f, d) for f, d in self.pts.items()
+                         if 'unaligned_label' in d]
+            _ESTEP_BATCH = 16
+            print(f'E-step batched GPU inference: {len(_pts_list)} clips '
+                  f'(batch={_ESTEP_BATCH})')
+            for _i in range(0, len(_pts_list), _ESTEP_BATCH):
+                _batch = _pts_list[_i: _i + _ESTEP_BATCH]
+                try:
+                    # audio is ignored inside forward() when CQT is provided,
+                    # so pad to a common length to satisfy torch.stack.
+                    _audios = [d['audio'].float() / 32768. for _, d in _batch]
+                    _max_alen = max(a.shape[0] for a in _audios)
+                    _batch_audio = torch.stack(
+                        [torch.nn.functional.pad(a, (0, _max_alen - a.shape[0]))
+                         for a in _audios]
+                    ).cuda()
+                    _cqt_list = [
+                        d['cqt'].cuda() if d.get('cqt') is not None else None
+                        for _, d in _batch
+                    ]
+                    _o_all, _, _, _f_all, _ = _inner(_batch_audio, cqt=_cqt_list)
+                    _o_all = _o_all.detach().cpu()
+                    _f_all = _f_all.detach().cpu()
+                    for _j, (_flac, _) in enumerate(_batch):
+                        _pred_cache[_flac] = (_o_all[_j], _f_all[_j])
+                    del _batch_audio, _o_all, _f_all
+                except Exception as _exc:
+                    print(f'Batch inference failed ({_exc}), falling back per-clip')
+                    for _flac, _d in _batch:
+                        _a = _d['audio'].float() / 32768.
+                        _a_cu = _a.unsqueeze(0).cuda()
+                        _c = _d.get('cqt')
+                        _c_cu = _c.unsqueeze(0).cuda() if _c is not None else None
+                        _o, _, _, _f, _ = _inner(_a_cu, cqt=_c_cu)
+                        _pred_cache[_flac] = (
+                            _o.detach().squeeze().cpu(),
+                            _f.detach().squeeze().cpu(),
+                        )
+                        del _a_cu, _c_cu, _o, _f
+                torch.cuda.empty_cache()
+        # ----------------------------------------------------------------------
+
         print('there are', len(self.pts), 'pts')
         for flac, data in self.pts.items():
             if 'unaligned_label' not in data:
                 continue
-            audio_inp = data['audio'].float() / 32768.
-            MAX_TIME = 5 * 60 * SAMPLE_RATE
-            audio_inp_len = len(audio_inp)
-            if audio_inp_len > MAX_TIME:
-                n_segments = 3 if audio_inp_len > 2 * MAX_TIME else 2
-                print('long audio, splitting to {} segments'.format(n_segments))
-                seg_len = audio_inp_len // n_segments
-                onsets_preds = []
-                offset_preds = []
-                frame_preds = []
-                vel_preds = []
-                for i_s in range(n_segments):
-                    curr = audio_inp[i_s * seg_len: (i_s + 1) * seg_len].unsqueeze(0).cuda()
-                    if _is_adapter:
-                        curr_onset_pred, curr_offset_pred, _, curr_frame_pred, curr_velocity_pred = transcriber(curr)
-                    else:
-                        curr_mel = melspectrogram(curr.reshape(-1, curr.shape[-1])[:, :-1]).transpose(-1, -2)
-                        curr_onset_pred, curr_offset_pred, _, curr_frame_pred, curr_velocity_pred = transcriber(curr_mel)
-                    onsets_preds.append(curr_onset_pred)
-                    offset_preds.append(curr_offset_pred)
-                    frame_preds.append(curr_frame_pred)
-                    vel_preds.append(curr_velocity_pred)
-                onset_pred = torch.cat(onsets_preds, dim=1)
-                offset_pred = torch.cat(offset_preds, dim=1)
-                frame_pred = torch.cat(frame_preds, dim=1)
-                velocity_pred = torch.cat(vel_preds, dim=1)
+            if _is_adapter and flac in _pred_cache:
+                # Fast path: use pre-computed predictions from the batched phase.
+                onset_pred = _pred_cache[flac][0]   # (T_mel, 88) CPU
+                frame_pred = _pred_cache[flac][1]   # (T_mel, 88) CPU
+                velocity_pred = None                # AST has no velocity head
+                audio_inp = None
             else:
-                audio_inp = audio_inp.unsqueeze(0).cuda()
-                if _is_adapter:
-                    _cqt = data.get('cqt')
-                    _cqt_inp = _cqt.unsqueeze(0).cuda() if _cqt is not None else None
-                    onset_pred, offset_pred, _, frame_pred, velocity_pred = transcriber(audio_inp, _cqt_inp)
+                audio_inp = data['audio'].float() / 32768.
+                MAX_TIME = 5 * 60 * SAMPLE_RATE
+                audio_inp_len = len(audio_inp)
+                if audio_inp_len > MAX_TIME:
+                    n_segments = 3 if audio_inp_len > 2 * MAX_TIME else 2
+                    print('long audio, splitting to {} segments'.format(n_segments))
+                    seg_len = audio_inp_len // n_segments
+                    onsets_preds = []
+                    offset_preds = []
+                    frame_preds = []
+                    vel_preds = []
+                    for i_s in range(n_segments):
+                        curr = audio_inp[i_s * seg_len: (i_s + 1) * seg_len].unsqueeze(0).cuda()
+                        if _is_adapter:
+                            curr_onset_pred, curr_offset_pred, _, curr_frame_pred, curr_velocity_pred = transcriber(curr)
+                        else:
+                            curr_mel = melspectrogram(curr.reshape(-1, curr.shape[-1])[:, :-1]).transpose(-1, -2)
+                            curr_onset_pred, curr_offset_pred, _, curr_frame_pred, curr_velocity_pred = transcriber(curr_mel)
+                        onsets_preds.append(curr_onset_pred)
+                        offset_preds.append(curr_offset_pred)
+                        frame_preds.append(curr_frame_pred)
+                        vel_preds.append(curr_velocity_pred)
+                    onset_pred = torch.cat(onsets_preds, dim=1)
+                    offset_pred = torch.cat(offset_preds, dim=1)
+                    frame_pred = torch.cat(frame_preds, dim=1)
+                    velocity_pred = torch.cat(vel_preds, dim=1)
                 else:
-                    mel = melspectrogram(audio_inp.reshape(-1, audio_inp.shape[-1])[:, :-1]).transpose(-1, -2)
-                    onset_pred, offset_pred, _, frame_pred, velocity_pred = transcriber(mel)
-            print('done predicting.')
+                    audio_inp = audio_inp.unsqueeze(0).cuda()
+                    if _is_adapter:
+                        _cqt = data.get('cqt')
+                        _cqt_inp = _cqt.unsqueeze(0).cuda() if _cqt is not None else None
+                        onset_pred, offset_pred, _, frame_pred, velocity_pred = transcriber(audio_inp, _cqt_inp)
+                    else:
+                        mel = melspectrogram(audio_inp.reshape(-1, audio_inp.shape[-1])[:, :-1]).transpose(-1, -2)
+                        onset_pred, offset_pred, _, frame_pred, velocity_pred = transcriber(mel)
+                print('done predicting.')
+                onset_pred = onset_pred.detach().squeeze().cpu()
+                frame_pred = frame_pred.detach().squeeze().cpu()
             # We assume onset predictions are of length N_KEYS * (len(instruments) + 1),
             # first N_KEYS classes are the first instrument, next N_KEYS classes are the next instrument, etc.,
             # and last N_KEYS classes are for pitch regardless of instrument
@@ -463,8 +571,30 @@ class EMDATASET(Dataset):
             print('bag of notes dist', bon_dist)
             ####
 
+            # For adapter mode: build a clean monophonic onset sequence for DTW.
+            # onset_pred[t,k] = sigmoid(onset_logit[t]) * P(oct_k|t) * P(cls_k|t).
+            # At threshold 0.05 this product exceeds the threshold at 3-4 neighboring
+            # pitches per real note, giving DTW ~163 pred events vs ~47 GT events —
+            # a ratio that makes temporal alignment meaningless.
+            # Fix: collapse to one onset event per frame using argmax pitch.
+            # onset_pred is already per-pitch peak-picked above, so onset_strength
+            # (max across pitches) is naturally sparse in time.
+            _ADAPTER_DTW_ONSET_THRESH = 0.2
+            if _is_adapter:
+                onset_strength  = onset_pred.max(dim=-1).values          # (T,)
+                active_frames   = (onset_strength > _ADAPTER_DTW_ONSET_THRESH).nonzero(as_tuple=False).view(-1)
+                onset_pred_for_dtw = torch.zeros_like(onset_pred)
+                for _t in active_frames.tolist():
+                    _best_k = int(onset_pred[_t].argmax())
+                    onset_pred_for_dtw[_t, _best_k] = onset_strength[_t].item()
+                onset_pred_np_for_dtw = onset_pred_for_dtw.numpy()
+                print(f'adapter mono DTW events: {len(active_frames)} pred, '
+                      f'{int(unaligned_onsets[:, -N_KEYS:].any(axis=1).sum())} gt frames')
+            else:
+                onset_pred_np_for_dtw = onset_pred_np
+
             # We align based on likelihoods regardless of the octave (chroma features)
-            onset_pred_comp = compress_across_octave(onset_pred_np[:, -N_KEYS:])
+            onset_pred_comp = compress_across_octave(onset_pred_np_for_dtw[:, -N_KEYS:])
             onset_label_comp = compress_across_octave(unaligned_onsets[:, -N_KEYS:])
             # We can do DTW on super-frames since anyway we search for local max afterwards
             onset_pred_comp = compress_time(onset_pred_comp, DTW_FACTOR)
@@ -634,7 +764,10 @@ class EMDATASET(Dataset):
                                                              aligned_onsets, aligned_frames,
                                                              onset_pred_np, frame_pred_np, prefix='BEST_BON')
 
-            velocity_pred = velocity_pred.detach().squeeze().cpu()
+            if velocity_pred is not None:
+                velocity_pred = velocity_pred.detach().squeeze().cpu()
+            else:
+                velocity_pred = torch.zeros(frame_pred.shape, dtype=torch.float32)
             # velocity_pred = torch.from_numpy(new_vels)
             velocity_pred = (128. * velocity_pred)
             velocity_pred[velocity_pred < 0.] = 0.
@@ -643,13 +776,17 @@ class EMDATASET(Dataset):
             if update:
                 data['velocity'] = velocity_pred
 
-            del audio_inp
+            if audio_inp is not None:
+                del audio_inp
             try:
                 del mel
             except:
                 pass
             del onset_pred
-            del offset_pred
+            try:
+                del offset_pred
+            except:
+                pass
             del frame_pred
             del velocity_pred
             torch.cuda.empty_cache()
