@@ -1,7 +1,7 @@
 """Evaluate and compare two AMT models on MIR-ST500 (quantized dataset).
 
 Models compared:
-  - Adapter  : AMTAdapter (EffNetb0 fine-tuned via NoteEM EM loop), epoch 5
+  - Adapter  : AMTAdapter (EffNetb0 fine-tuned via NoteEM EM loop), epoch 15
   - ZeroShot : EffNetb0 (AST) wrapped in AMTAdapter, no fine-tuning
 
 Both models run on the same #0 (unshifted) segments from
@@ -38,10 +38,13 @@ from onsets_and_frames.utils import get_peaks
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 AUDIO_DIR          = '/data/hakka/mynoteem_new/data/mirst500_15sec_data_full_quantized_NoteEM_audio'
-ADAPTER_MODEL_PATH = '/data/hakka/mynoteem_new/runs/transcriber-260908-192658/transcriber_10.pt'
 ZS_MODEL_PATH      = '/data/hakka/singing_transcription_ICASSP2021/AST/models/1005_e_4'
+ZS_CACHE_JSON      = '/data/hakka/mynoteem_new/mirst_zeroshot_viz/mirst_zeroshot_results.json'
 GT_JSON            = '/data/hakka/singing_transcription_ICASSP2021/MIR-ST500_20210206/MIR-ST500_corrected.json'
-OUT_DIR            = '/data/hakka/mynoteem_new/test_adapter_results_192658'
+
+run_dir = 'transcriber-260908-192658'
+ADAPTER_MODEL_PATH = f'/data/hakka/mynoteem_new/runs/{run_dir}/transcriber_15.pt'
+OUT_DIR            = f'/data/hakka/mynoteem_new/runs/{run_dir}/test_results'
 
 # ─── Hyper-parameters ─────────────────────────────────────────────────────────
 SEGMENT_HOP     = 15.0   # seconds (must match preprocess_mirst500.py)
@@ -72,6 +75,25 @@ def load_zeroshot_model():
         strict=False,
     )
     return AMTAdapter(backbone).cuda().eval()
+
+
+def load_zs_from_cache(path):
+    with open(path) as f:
+        data = json.load(f)
+    zs_pred = defaultdict(list)
+    for seg_key, entry in data.items():           # 'mirst_{sid}_seg{i}'
+        m = re.match(r'^mirst_(\d+)_seg(\d+)$', seg_key)
+        if m is None:
+            continue
+        sid    = m.group(1)
+        offset = int(m.group(2)) * SEGMENT_HOP
+        for on_rel, off_rel, midi in entry.get('pred', []):
+            zs_pred[sid].append((round(on_rel + offset, 6),
+                                 round(off_rel + offset, 6),
+                                 midi))
+    for sid in zs_pred:
+        zs_pred[sid].sort()
+    return zs_pred
 
 
 # ─── Segment discovery ────────────────────────────────────────────────────────
@@ -261,7 +283,7 @@ def plot_comparison(summary_adapter, summary_zs, n_songs, out_path):
 
     fig, ax = plt.subplots(figsize=(13, 5))
     fig.suptitle(
-        f'Adapter EM (epoch 5) vs Zero-Shot EffNetb0 — MIR-ST500 ({n_songs} songs)',
+        f'Adapter EM (epoch 15) vs Zero-Shot EffNetb0 — MIR-ST500 ({n_songs} songs)',
         fontweight='bold', fontsize=13,
     )
 
@@ -325,6 +347,8 @@ def main():
                         help='Process only first N segments (quick smoke-test)')
     parser.add_argument('--skip-zeroshot', action='store_true',
                         help='Re-use cached zeroshot results from JSON if present')
+    parser.add_argument('--zs-json', default=ZS_CACHE_JSON,
+                        help='Path to mirst_zeroshot_results.json (default: ZS_CACHE_JSON)')
     args = parser.parse_args()
 
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -354,7 +378,10 @@ def main():
     cached_json = os.path.join(OUT_DIR, 'results.json')
     zs_pred = None
 
-    if args.skip_zeroshot and os.path.isfile(cached_json):
+    if os.path.isfile(args.zs_json):
+        print(f'\nLoading ZS predictions from {args.zs_json} ...')
+        zs_pred = load_zs_from_cache(args.zs_json)
+    elif args.skip_zeroshot and os.path.isfile(cached_json):
         print('\nLoading cached zero-shot predictions from results.json ...')
         with open(cached_json) as f:
             prev = json.load(f)

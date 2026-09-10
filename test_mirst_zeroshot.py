@@ -35,12 +35,12 @@ from onsets_and_frames.utils import get_peaks
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-AUDIO_DIR  = '/data/hakka/mynoteem_new/data/mirst500_15sec_data_full_NoteEM_audio'
+AUDIO_DIR  = '/data/hakka/mynoteem_new/data/mirst500_15sec_data_full_quantized_NoteEM_audio'
 MODEL_PATH = '/data/hakka/singing_transcription_ICASSP2021/AST/models/1005_e_4'
 GT_JSON    = '/data/hakka/singing_transcription_ICASSP2021/MIR-ST500_20210206/MIR-ST500_corrected.json'
-OUT_JSON   = '/data/hakka/mynoteem_new/mirst_zeroshot_viz/mirst_zeroshot_results.json'
-VIZ_DIR    = '/data/hakka/mynoteem_new/mirst_zeroshot_viz'
-ARRAYS_DIR = '/data/hakka/mynoteem_new/mirst_zeroshot_viz/arrays'
+OUT_JSON   = '/data/hakka/mynoteem_new/test_zeroshot/mirst_zeroshot_results.json'
+VIZ_DIR    = '/data/hakka/mynoteem_new/test_zeroshot'
+ARRAYS_DIR = '/data/hakka/mynoteem_new/test_zeroshot/arrays'
 
 SEGMENT_HOP      = 15.0  # seconds between segment starts (matches preprocess_mirst500.py)
 ONSET_THRESHOLD  = 0.05  # minimum post-peak onset probability to count as a note

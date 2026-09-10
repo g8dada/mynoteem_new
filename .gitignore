@@ -7,6 +7,7 @@ __pycache__/
 # Generated training data (large, reproducible by running preprocessing)
 data/
 logs/
+test_zeroshot/
 
 # Training run outputs (large checkpoints and MIDI alignments)
 runs/
