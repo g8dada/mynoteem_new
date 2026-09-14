@@ -91,6 +91,71 @@ def _visualize_notes(viz_dir, seg_key, history):
     print(f'Saved viz: {out}')
 
 
+def _visualize_dtw_inputs(viz_dir, seg_key, onset_pred_comp, onset_label_comp, viz_tag):
+    """
+    Two-panel heatmap showing what DTW literally receives.
+    Top: model onset predictions compressed to chroma × time.
+    Bottom: unaligned MIDI compressed to chroma × time.
+    Saved as {seg_key}_dtw_{viz_tag}.png — one file per epoch.
+    """
+    os.makedirs(viz_dir, exist_ok=True)
+    fig, axes = plt.subplots(2, 1, figsize=(14, 4), sharex=False)
+    fig.suptitle(f'DTW inputs: {seg_key} — {viz_tag}', fontsize=9, fontweight='bold')
+
+    im0 = axes[0].imshow(onset_pred_comp.T, aspect='auto', origin='lower',
+                         cmap='hot', vmin=0, vmax=1.0, interpolation='nearest')
+    axes[0].set_title('Model onset — chroma × compressed time (peak-picked)', fontsize=8)
+    axes[0].set_ylabel('chroma bin', fontsize=7)
+    axes[0].tick_params(labelsize=6)
+    plt.colorbar(im0, ax=axes[0], fraction=0.02, pad=0.02)
+
+    im1 = axes[1].imshow(onset_label_comp.T, aspect='auto', origin='lower',
+                         cmap='hot', vmin=0, vmax=1.0, interpolation='nearest')
+    axes[1].set_title(f'Unaligned MIDI — chroma × compressed time (DTW_FACTOR={DTW_FACTOR})', fontsize=8)
+    axes[1].set_ylabel('chroma bin', fontsize=7)
+    axes[1].set_xlabel('compressed time frame', fontsize=7)
+    axes[1].tick_params(labelsize=6)
+    plt.colorbar(im1, ax=axes[1], fraction=0.02, pad=0.02)
+
+    plt.tight_layout()
+    out = os.path.join(viz_dir, f'{seg_key}_dtw_{viz_tag}.png')
+    plt.savefig(out, dpi=100, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Saved DTW viz: {out}')
+
+
+def _visualize_onset_heatmap(viz_dir, seg_key, onset_pred_pitch, aligned_onsets_pitch, viz_tag):
+    """
+    Full-resolution onset probability heatmap (88 keys × time frames).
+    Background intensity = raw model probability after peak-picking.
+    Cyan dots = where DTW placed aligned onsets (the actual pseudo-labels).
+    Saved as {seg_key}_heatmap_{viz_tag}.png — one file per epoch.
+    """
+    os.makedirs(viz_dir, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(14, 5))
+
+    im = ax.imshow(onset_pred_pitch.T, aspect='auto', origin='lower',
+                   cmap='hot', vmin=0, vmax=1.0, interpolation='nearest')
+    plt.colorbar(im, ax=ax, fraction=0.015, pad=0.01, label='onset probability')
+
+    t_idx, f_idx = np.where(aligned_onsets_pitch)
+    if len(t_idx) > 0:
+        ax.scatter(t_idx, f_idx, s=6, c='cyan', alpha=0.8, linewidths=0,
+                   label='aligned onset (pseudo-label)')
+        ax.legend(fontsize=7, loc='upper right', markerscale=2)
+
+    ax.set_title(f'Onset probability heatmap — {seg_key} {viz_tag}', fontsize=9)
+    ax.set_xlabel('time frame', fontsize=8)
+    ax.set_ylabel(f'pitch index (0 = MIDI {MIN_MIDI})', fontsize=8)
+    ax.tick_params(labelsize=6)
+
+    plt.tight_layout()
+    out = os.path.join(viz_dir, f'{seg_key}_heatmap_{viz_tag}.png')
+    plt.savefig(out, dpi=100, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Saved heatmap viz: {out}')
+
+
 def _compute_cqt(audio_short):
     """Resample ShortTensor audio (16 kHz) and compute CQT for AMTAdapter caching."""
     audio_np = audio_short.float().numpy() / 32768.0
@@ -713,6 +778,12 @@ class EMDATASET(Dataset):
                         'gt': [(o, f, m) for o, f, m in gt_notes],
                     }
                     _visualize_notes(viz_dir, seg_key, self._notes_history[seg_key])
+                    _visualize_dtw_inputs(viz_dir, seg_key,
+                                          onset_pred_comp, onset_label_comp, viz_tag)
+                    _visualize_onset_heatmap(viz_dir, seg_key,
+                                             onset_pred_np[:, -N_KEYS:],
+                                             aligned_onsets[:, -N_KEYS:],
+                                             viz_tag)
                     if notes_json_path is not None:
                         try:
                             with open(notes_json_path, 'w') as jf:

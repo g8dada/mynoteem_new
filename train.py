@@ -24,8 +24,8 @@ ex = Experiment('train_transcriber')
 
 @ex.config
 def config():
-    logdir = 'runs/transcriber-' + datetime.now().strftime('%y%m%d-%H%M%S') # ckpts and midi will be saved here
     adapter_mode = False  # Set True to use EffNetb0 (AST) as the EM backbone instead of OnsetsAndFrames
+    logdir = 'runs/transcriber-' + datetime.now().strftime('%y%m%d-%H%M%S') + f'-adapter_{adapter_mode}' # ckpts and midi will be saved here
     transcriber_ckpt = '/data/hakka/singing_transcription_ICASSP2021/AST/models/1005_e_4' if adapter_mode else 'ckpts/model_64.pt'
     # When adapter_mode=True, override transcriber_ckpt with the AST checkpoint, e.g.:
     #   transcriber_ckpt = '/data/hakka/singing_transcription_ICASSP2021/AST/models/1005_e_4'
