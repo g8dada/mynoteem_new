@@ -71,7 +71,9 @@ def _visualize_notes(viz_dir, seg_key, history):
 
         ax.set_xlim(0, 15)
         ax.set_ylim(MIN_MIDI - 1, MAX_MIDI + 1)
-        ax.set_ylabel(tag, fontsize=7)
+        _bd = entry.get('dtw', {}).get('bon_dist')
+        _bd_str = f'\nBON={_bd:.4f}' if _bd is not None else ''
+        ax.set_ylabel(f'{tag}{_bd_str}', fontsize=7)
         ax.tick_params(labelsize=6)
         if row < n - 1:
             ax.set_xticks([])
@@ -91,16 +93,20 @@ def _visualize_notes(viz_dir, seg_key, history):
     print(f'Saved viz: {out}')
 
 
-def _visualize_dtw_inputs(viz_dir, seg_key, onset_pred_comp, onset_label_comp, viz_tag):
+def _visualize_diag(viz_dir, seg_key, onset_pred_comp, onset_label_comp,
+                    onset_pred_pitch, aligned_onsets_pitch, viz_tag, bon_dist=None):
     """
-    Two-panel heatmap showing what DTW literally receives.
-    Top: model onset predictions compressed to chroma × time.
-    Bottom: unaligned MIDI compressed to chroma × time.
-    Saved as {seg_key}_dtw_{viz_tag}.png — one file per epoch.
+    3-panel diagnostic figure saved as {seg_key}_diag_{viz_tag}.png.
+    Panel 1: model onset chroma × compressed time  (DTW input from model).
+    Panel 2: unaligned MIDI chroma × compressed time (DTW target, fixed across epochs).
+    Panel 3: full 88-key onset probability heatmap + aligned onsets as hollow lime markers.
+    Reading top-to-bottom shows the causal chain: what DTW compared → what it produced.
     """
     os.makedirs(viz_dir, exist_ok=True)
-    fig, axes = plt.subplots(2, 1, figsize=(14, 4), sharex=False)
-    fig.suptitle(f'DTW inputs: {seg_key} — {viz_tag}', fontsize=9, fontweight='bold')
+    fig, axes = plt.subplots(3, 1, figsize=(14, 9),
+                             gridspec_kw={'height_ratios': [1, 1, 2]})
+    bon_str = f'  |  BON dist: {bon_dist:.4f}' if bon_dist is not None else ''
+    fig.suptitle(f'{seg_key} — {viz_tag}{bon_str}', fontsize=10, fontweight='bold')
 
     im0 = axes[0].imshow(onset_pred_comp.T, aspect='auto', origin='lower',
                          cmap='hot', vmin=0, vmax=1.0, interpolation='nearest')
@@ -113,47 +119,27 @@ def _visualize_dtw_inputs(viz_dir, seg_key, onset_pred_comp, onset_label_comp, v
                          cmap='hot', vmin=0, vmax=1.0, interpolation='nearest')
     axes[1].set_title(f'Unaligned MIDI — chroma × compressed time (DTW_FACTOR={DTW_FACTOR})', fontsize=8)
     axes[1].set_ylabel('chroma bin', fontsize=7)
-    axes[1].set_xlabel('compressed time frame', fontsize=7)
     axes[1].tick_params(labelsize=6)
     plt.colorbar(im1, ax=axes[1], fraction=0.02, pad=0.02)
 
-    plt.tight_layout()
-    out = os.path.join(viz_dir, f'{seg_key}_dtw_{viz_tag}.png')
-    plt.savefig(out, dpi=100, bbox_inches='tight')
-    plt.close(fig)
-    print(f'Saved DTW viz: {out}')
-
-
-def _visualize_onset_heatmap(viz_dir, seg_key, onset_pred_pitch, aligned_onsets_pitch, viz_tag):
-    """
-    Full-resolution onset probability heatmap (88 keys × time frames).
-    Background intensity = raw model probability after peak-picking.
-    Cyan dots = where DTW placed aligned onsets (the actual pseudo-labels).
-    Saved as {seg_key}_heatmap_{viz_tag}.png — one file per epoch.
-    """
-    os.makedirs(viz_dir, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(14, 5))
-
-    im = ax.imshow(onset_pred_pitch.T, aspect='auto', origin='lower',
-                   cmap='hot', vmin=0, vmax=1.0, interpolation='nearest')
-    plt.colorbar(im, ax=ax, fraction=0.015, pad=0.01, label='onset probability')
-
+    im2 = axes[2].imshow(onset_pred_pitch.T, aspect='auto', origin='lower',
+                         cmap='hot', vmin=0, vmax=1.0, interpolation='nearest')
+    plt.colorbar(im2, ax=axes[2], fraction=0.015, pad=0.01, label='onset probability')
     t_idx, f_idx = np.where(aligned_onsets_pitch)
     if len(t_idx) > 0:
-        ax.scatter(t_idx, f_idx, s=6, c='cyan', alpha=0.8, linewidths=0,
-                   label='aligned onset (pseudo-label)')
-        ax.legend(fontsize=7, loc='upper right', markerscale=2)
-
-    ax.set_title(f'Onset probability heatmap — {seg_key} {viz_tag}', fontsize=9)
-    ax.set_xlabel('time frame', fontsize=8)
-    ax.set_ylabel(f'pitch index (0 = MIDI {MIN_MIDI})', fontsize=8)
-    ax.tick_params(labelsize=6)
+        axes[2].scatter(t_idx, f_idx, s=25, facecolors='none', edgecolors='lime',
+                        linewidth=1.5, zorder=5, label='aligned onset (pseudo-label)')
+        axes[2].legend(fontsize=7, loc='upper right', markerscale=1.5)
+    axes[2].set_title('Onset probability heatmap + aligned onsets', fontsize=8)
+    axes[2].set_xlabel('time frame', fontsize=8)
+    axes[2].set_ylabel(f'pitch index (0 = MIDI {MIN_MIDI})', fontsize=8)
+    axes[2].tick_params(labelsize=6)
 
     plt.tight_layout()
-    out = os.path.join(viz_dir, f'{seg_key}_heatmap_{viz_tag}.png')
+    out = os.path.join(viz_dir, f'{seg_key}_diag_{viz_tag}.png')
     plt.savefig(out, dpi=100, bbox_inches='tight')
     plt.close(fig)
-    print(f'Saved heatmap viz: {out}')
+    print(f'Saved diag viz: {out}')
 
 
 def _compute_cqt(audio_short):
@@ -644,7 +630,7 @@ class EMDATASET(Dataset):
             # Fix: collapse to one onset event per frame using argmax pitch.
             # onset_pred is already per-pitch peak-picked above, so onset_strength
             # (max across pitches) is naturally sparse in time.
-            _ADAPTER_DTW_ONSET_THRESH = 0.2
+            _ADAPTER_DTW_ONSET_THRESH = 0.0
             if _is_adapter:
                 onset_strength  = onset_pred.max(dim=-1).values          # (T,)
                 active_frames   = (onset_strength > _ADAPTER_DTW_ONSET_THRESH).nonzero(as_tuple=False).view(-1)
@@ -776,14 +762,22 @@ class EMDATASET(Dataset):
                     self._notes_history[seg_key][viz_tag] = {
                         'pred': pred_notes,
                         'gt': [(o, f, m) for o, f, m in gt_notes],
+                        'dtw': {
+                            'bon_dist': float(bon_dist),
+                            'dtw_normalized_distance': float(alignment.normalizedDistance),
+                            'dtw_pred_frames': int(onset_pred_comp.shape[0]),
+                            'dtw_label_frames': int(onset_label_comp.shape[0]),
+                            'n_pred_events': int((onset_pred_np[:, -N_KEYS:] > 0).any(axis=1).sum()),
+                            'n_label_events': int(unaligned_onsets[:, -N_KEYS:].any(axis=1).sum()),
+                            'n_aligned_onsets': int(aligned_onsets[:, -N_KEYS:].sum()),
+                        },
                     }
                     _visualize_notes(viz_dir, seg_key, self._notes_history[seg_key])
-                    _visualize_dtw_inputs(viz_dir, seg_key,
-                                          onset_pred_comp, onset_label_comp, viz_tag)
-                    _visualize_onset_heatmap(viz_dir, seg_key,
-                                             onset_pred_np[:, -N_KEYS:],
-                                             aligned_onsets[:, -N_KEYS:],
-                                             viz_tag)
+                    _visualize_diag(viz_dir, seg_key,
+                                    onset_pred_comp, onset_label_comp,
+                                    onset_pred_np[:, -N_KEYS:],
+                                    aligned_onsets[:, -N_KEYS:],
+                                    viz_tag, bon_dist=bon_dist)
                     if notes_json_path is not None:
                         try:
                             with open(notes_json_path, 'w') as jf:
