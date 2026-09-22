@@ -170,7 +170,7 @@ def train(logdir, device, iterations, checkpoint_interval, batch_size, sequence_
             batch = next(curr_loader)
             optimizer.zero_grad()
 
-            n_weight = 5 if adapter_mode else (1 if HOP_LENGTH == 512 else 2)
+            n_weight = 1 if adapter_mode else (1 if HOP_LENGTH == 512 else 2)
             transcription, transcription_losses = transcriber.run_on_batch(batch, parallel_transcriber,
                                                                            positive_weight=n_weight,
                                                                            inv_positive_weight=n_weight,

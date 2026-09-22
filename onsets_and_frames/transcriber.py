@@ -425,9 +425,12 @@ class AMTAdapter(nn.Module):
         offset_mask = 1. * offset_label * (2. - 1) + 1.
         frame_mask = 1. * frame_label * (2. - 1) + 1.
 
+        _PRESENCE_POS_WEIGHT = 10.0
+
         total_onset = 0.
         total_offset = 0.
         total_frame = 0.
+        total_presence = 0.
         onset_preds, frame_preds, offset_preds = [], [], []
 
         for b in range(B):
@@ -441,13 +444,22 @@ class AMTAdapter(nn.Module):
             f_loss = (frame_mask[b:b + 1] * F.binary_cross_entropy(
                 f, frame_label[b:b + 1], reduction='none')).mean()
 
+            # Frame-level onset presence loss: trains onset_logit against "any onset in frame?"
+            # Fixes the 88-vs-1 class imbalance that collapses onset_logit with per-pitch BCE alone.
+            onset_frame_pred = o[..., -N_KEYS:].max(dim=-1).values          # (1, T)
+            onset_frame_label = onset_label[b:b+1, :, -N_KEYS:].any(dim=-1).float()  # (1, T)
+            _fw = onset_frame_label * (_PRESENCE_POS_WEIGHT - 1) + 1       # 50 for positives, 1 for negatives
+            presence_loss = (_fw * F.binary_cross_entropy(
+                onset_frame_pred, onset_frame_label, reduction='none')).mean()
+
             # Divide by B so gradient magnitude matches a full-batch average
-            clip_loss = (o_loss + of_loss + f_loss) / B
+            clip_loss = (o_loss + of_loss + f_loss + presence_loss) / B
             clip_loss.backward()
 
             total_onset += o_loss.item()
             total_offset += of_loss.item()
             total_frame += f_loss.item()
+            total_presence += presence_loss.item()
 
             onset_preds.append(o.detach())
             frame_preds.append(f.detach())
@@ -463,8 +475,9 @@ class AMTAdapter(nn.Module):
 
         # Non-differentiable scalars — backward is already done above
         losses = {
-            'loss/onset':  torch.tensor(total_onset  / B),
-            'loss/offset': torch.tensor(total_offset / B),
-            'loss/frame':  torch.tensor(total_frame  / B),
+            'loss/onset':    torch.tensor(total_onset    / B),
+            'loss/offset':   torch.tensor(total_offset   / B),
+            'loss/frame':    torch.tensor(total_frame    / B),
+            'loss/presence': torch.tensor(total_presence / B),
         }
         return predictions, losses
