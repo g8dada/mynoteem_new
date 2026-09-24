@@ -622,24 +622,36 @@ class EMDATASET(Dataset):
             print('bag of notes dist', bon_dist)
             ####
 
-            # For adapter mode: build a clean monophonic onset sequence for DTW.
-            # onset_pred[t,k] = sigmoid(onset_logit[t]) * P(oct_k|t) * P(cls_k|t).
-            # At threshold 0.05 this product exceeds the threshold at 3-4 neighboring
-            # pitches per real note, giving DTW ~163 pred events vs ~47 GT events —
-            # a ratio that makes temporal alignment meaningless.
-            # Fix: collapse to one onset event per frame using argmax pitch.
-            # onset_pred is already per-pitch peak-picked above, so onset_strength
-            # (max across pitches) is naturally sparse in time.
-            _ADAPTER_DTW_ONSET_THRESH = 0.0
+            # For adapter mode: build a sparse onset piano-roll for DTW via note extraction.
+            # Raw peak-picked onset_pred has high values throughout note sustain (AST features
+            # are nearly constant during a sustained note), giving DTW hundreds of events vs
+            # ~20 GT events — too dense for meaningful alignment.
+            # Fix: extract notes (onset peak + frame sustain tracking + min-duration filter)
+            # so DTW receives one spike per note, matching the sparse GT chroma structure.
             if _is_adapter:
-                onset_strength  = onset_pred.max(dim=-1).values          # (T,)
-                active_frames   = (onset_strength > _ADAPTER_DTW_ONSET_THRESH).nonzero(as_tuple=False).view(-1)
-                onset_pred_for_dtw = torch.zeros_like(onset_pred)
-                for _t in active_frames.tolist():
-                    _best_k = int(onset_pred[_t].argmax())
-                    onset_pred_for_dtw[_t, _best_k] = onset_strength[_t].item()
-                onset_pred_np_for_dtw = onset_pred_for_dtw.numpy()
-                print(f'adapter mono DTW events: {len(active_frames)} pred, '
+                _DTW_ONSET_THRESH = 0.05
+                _DTW_FRAME_THRESH = 0.05
+                _DTW_MIN_NOTE_FRAMES = 3
+                onsets_bin = (onset_pred_np > _DTW_ONSET_THRESH).astype(np.uint8)
+                frames_bin = (frame_pred_np > _DTW_FRAME_THRESH).astype(np.uint8)
+                onset_pred_for_dtw = np.zeros_like(onset_pred_np)
+                n_extracted = 0
+                for k in range(N_KEYS):
+                    t = 0
+                    while t < len(onsets_bin):
+                        if not onsets_bin[t, k]:
+                            t += 1
+                            continue
+                        f_on = t
+                        f_off = t
+                        while f_off < len(onsets_bin) and (onsets_bin[f_off, k] or frames_bin[f_off, k]):
+                            f_off += 1
+                        if f_off - f_on >= _DTW_MIN_NOTE_FRAMES:
+                            onset_pred_for_dtw[f_on, k] = onset_pred_np[f_on, k]
+                            n_extracted += 1
+                        t = f_off if f_off > t else t + 1
+                onset_pred_np_for_dtw = onset_pred_for_dtw
+                print(f'adapter note-extract DTW events: {n_extracted} pred, '
                       f'{int(unaligned_onsets[:, -N_KEYS:].any(axis=1).sum())} gt frames')
             else:
                 onset_pred_np_for_dtw = onset_pred_np
