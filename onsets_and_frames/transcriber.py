@@ -426,11 +426,13 @@ class AMTAdapter(nn.Module):
         frame_mask = 1. * frame_label * (2. - 1) + 1.
 
         _PRESENCE_POS_WEIGHT = 10.0
+        _SPARSITY_WEIGHT = 0.1   # L1 penalty on frame_pred mean to discourage saturation
 
         total_onset = 0.
         total_offset = 0.
         total_frame = 0.
         total_presence = 0.
+        total_sparsity = 0.
         onset_preds, frame_preds, offset_preds = [], [], []
 
         for b in range(B):
@@ -452,14 +454,19 @@ class AMTAdapter(nn.Module):
             presence_loss = (_fw * F.binary_cross_entropy(
                 onset_frame_pred, onset_frame_label, reduction='none')).mean()
 
+            # L1 sparsity on frame_pred: penalises high activations at every frame to
+            # prevent frame_pred from saturating, which would break note extraction in E-step.
+            sparsity_loss = f[..., -N_KEYS:].mean() * _SPARSITY_WEIGHT
+
             # Divide by B so gradient magnitude matches a full-batch average
-            clip_loss = (o_loss + of_loss + f_loss + presence_loss) / B
+            clip_loss = (o_loss + of_loss + f_loss + presence_loss + sparsity_loss) / B
             clip_loss.backward()
 
             total_onset += o_loss.item()
             total_offset += of_loss.item()
             total_frame += f_loss.item()
             total_presence += presence_loss.item()
+            total_sparsity += sparsity_loss.item()
 
             onset_preds.append(o.detach())
             frame_preds.append(f.detach())
@@ -478,6 +485,7 @@ class AMTAdapter(nn.Module):
             'loss/onset':    torch.tensor(total_onset    / B),
             'loss/offset':   torch.tensor(total_offset   / B),
             'loss/frame':    torch.tensor(total_frame    / B),
-            'loss/presence': torch.tensor(total_presence / B),
+            'loss/presence':  torch.tensor(total_presence  / B),
+            'loss/sparsity':  torch.tensor(total_sparsity  / B),
         }
         return predictions, losses

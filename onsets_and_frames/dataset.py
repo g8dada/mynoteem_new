@@ -93,47 +93,75 @@ def _visualize_notes(viz_dir, seg_key, history):
     print(f'Saved viz: {out}')
 
 
-def _visualize_diag(viz_dir, seg_key, onset_pred_comp, onset_label_comp,
-                    onset_pred_pitch, aligned_onsets_pitch, viz_tag, bon_dist=None):
+def _visualize_diag(viz_dir, seg_key, onset_pred_pitch, aligned_onsets_pitch,
+                    viz_tag, bon_dist=None,
+                    pred_raw=None, pred_smooth=None,
+                    label_raw=None, label_smooth=None):
     """
-    3-panel diagnostic figure saved as {seg_key}_diag_{viz_tag}.png.
-    Panel 1: model onset chroma × compressed time  (DTW input from model).
-    Panel 2: unaligned MIDI chroma × compressed time (DTW target, fixed across epochs).
-    Panel 3: full 88-key onset probability heatmap + aligned onsets as hollow lime markers.
-    Reading top-to-bottom shows the causal chain: what DTW compared → what it produced.
+    Diagnostic figure saved as {seg_key}_diag_{viz_tag}.png.
+    Non-adapter: 3 panels (pred chroma, GT chroma, heatmap).
+    Adapter:     5 panels (pred raw, pred smoothed, GT raw, GT smoothed, heatmap).
     """
     os.makedirs(viz_dir, exist_ok=True)
-    fig, axes = plt.subplots(3, 1, figsize=(14, 9),
-                             gridspec_kw={'height_ratios': [1, 1, 2]})
+    is_adapter_viz = pred_smooth is not None
     bon_str = f'  |  BON dist: {bon_dist:.4f}' if bon_dist is not None else ''
-    fig.suptitle(f'{seg_key} — {viz_tag}{bon_str}', fontsize=10, fontweight='bold')
 
-    im0 = axes[0].imshow(onset_pred_comp.T, aspect='auto', origin='lower',
-                         cmap='hot', vmin=0, vmax=1.0, interpolation='nearest')
-    axes[0].set_title('Model onset — chroma × compressed time (peak-picked)', fontsize=8)
-    axes[0].set_ylabel('chroma bin', fontsize=7)
-    axes[0].tick_params(labelsize=6)
-    plt.colorbar(im0, ax=axes[0], fraction=0.02, pad=0.02)
+    if is_adapter_viz:
+        fig, axes = plt.subplots(5, 1, figsize=(14, 13),
+                                 gridspec_kw={'height_ratios': [1, 1, 1, 1, 2]})
+        fig.suptitle(f'{seg_key} — {viz_tag}{bon_str}', fontsize=10, fontweight='bold')
 
-    im1 = axes[1].imshow(onset_label_comp.T, aspect='auto', origin='lower',
-                         cmap='hot', vmin=0, vmax=1.0, interpolation='nearest')
-    axes[1].set_title(f'Unaligned MIDI — chroma × compressed time (DTW_FACTOR={DTW_FACTOR})', fontsize=8)
-    axes[1].set_ylabel('chroma bin', fontsize=7)
-    axes[1].tick_params(labelsize=6)
-    plt.colorbar(im1, ax=axes[1], fraction=0.02, pad=0.02)
+        vmax_pred  = max(pred_raw.max(),  1e-6)
+        vmax_label = max(label_raw.max(), 1e-6)
 
-    im2 = axes[2].imshow(onset_pred_pitch.T, aspect='auto', origin='lower',
-                         cmap='hot', vmin=0, vmax=1.0, interpolation='nearest')
-    plt.colorbar(im2, ax=axes[2], fraction=0.015, pad=0.01, label='onset probability')
+        chroma_panels = [
+            (axes[0], pred_raw,    'Pred  — raw (peak-picked)',              vmax_pred),
+            (axes[1], pred_smooth, 'Pred  — Gaussian smoothed (DTW input)',   vmax_pred),
+            (axes[2], label_raw,   'GT    — raw (unaligned MIDI)',            vmax_label),
+            (axes[3], label_smooth,'GT    — Gaussian smoothed (DTW input)',    vmax_label),
+        ]
+        for ax, data, title, vmax in chroma_panels:
+            im = ax.imshow(data.T, aspect='auto', origin='lower',
+                           cmap='hot', vmin=0, vmax=vmax, interpolation='nearest')
+            ax.set_title(title, fontsize=8)
+            ax.set_ylabel('chroma bin', fontsize=7)
+            ax.tick_params(labelsize=6)
+            plt.colorbar(im, ax=ax, fraction=0.02, pad=0.02)
+        heatmap_ax = axes[4]
+    else:
+        fig, axes = plt.subplots(3, 1, figsize=(14, 9),
+                                 gridspec_kw={'height_ratios': [1, 1, 2]})
+        fig.suptitle(f'{seg_key} — {viz_tag}{bon_str}', fontsize=10, fontweight='bold')
+
+        im0 = axes[0].imshow(pred_raw.T, aspect='auto', origin='lower',
+                             cmap='hot', vmin=0, vmax=max(pred_raw.max(), 1e-6),
+                             interpolation='nearest')
+        axes[0].set_title('Model onset — chroma × compressed time (peak-picked)', fontsize=8)
+        axes[0].set_ylabel('chroma bin', fontsize=7)
+        axes[0].tick_params(labelsize=6)
+        plt.colorbar(im0, ax=axes[0], fraction=0.02, pad=0.02)
+
+        im1 = axes[1].imshow(label_raw.T, aspect='auto', origin='lower',
+                             cmap='hot', vmin=0, vmax=max(label_raw.max(), 1e-6),
+                             interpolation='nearest')
+        axes[1].set_title(f'Unaligned MIDI — chroma × compressed time (DTW_FACTOR={DTW_FACTOR})', fontsize=8)
+        axes[1].set_ylabel('chroma bin', fontsize=7)
+        axes[1].tick_params(labelsize=6)
+        plt.colorbar(im1, ax=axes[1], fraction=0.02, pad=0.02)
+        heatmap_ax = axes[2]
+
+    im_h = heatmap_ax.imshow(onset_pred_pitch.T, aspect='auto', origin='lower',
+                              cmap='hot', vmin=0, vmax=1.0, interpolation='nearest')
+    plt.colorbar(im_h, ax=heatmap_ax, fraction=0.015, pad=0.01, label='onset probability')
     t_idx, f_idx = np.where(aligned_onsets_pitch)
     if len(t_idx) > 0:
-        axes[2].scatter(t_idx, f_idx, s=25, facecolors='none', edgecolors='lime',
-                        linewidth=1.5, zorder=5, label='aligned onset (pseudo-label)')
-        axes[2].legend(fontsize=7, loc='upper right', markerscale=1.5)
-    axes[2].set_title('Onset probability heatmap + aligned onsets', fontsize=8)
-    axes[2].set_xlabel('time frame', fontsize=8)
-    axes[2].set_ylabel(f'pitch index (0 = MIDI {MIN_MIDI})', fontsize=8)
-    axes[2].tick_params(labelsize=6)
+        heatmap_ax.scatter(t_idx, f_idx, s=25, facecolors='none', edgecolors='lime',
+                           linewidth=1.5, zorder=5, label='aligned onset (pseudo-label)')
+        heatmap_ax.legend(fontsize=7, loc='upper right', markerscale=1.5)
+    heatmap_ax.set_title('Onset probability heatmap + aligned onsets', fontsize=8)
+    heatmap_ax.set_xlabel('time frame', fontsize=8)
+    heatmap_ax.set_ylabel(f'pitch index (0 = MIDI {MIN_MIDI})', fontsize=8)
+    heatmap_ax.tick_params(labelsize=6)
 
     plt.tight_layout()
     out = os.path.join(viz_dir, f'{seg_key}_diag_{viz_tag}.png')
@@ -662,6 +690,15 @@ class EMDATASET(Dataset):
             # We can do DTW on super-frames since anyway we search for local max afterwards
             onset_pred_comp = compress_time(onset_pred_comp, DTW_FACTOR)
             onset_label_comp = compress_time(onset_label_comp, DTW_FACTOR)
+
+            if _is_adapter:
+                from scipy.ndimage import gaussian_filter1d
+                _DTW_GAUSS_SIGMA = 2.0  # compressed frames (~192ms at 512 hop, DTW_FACTOR=3)
+                _onset_pred_comp_raw  = onset_pred_comp.copy()
+                _onset_label_comp_raw = onset_label_comp.copy()
+                onset_pred_comp  = gaussian_filter1d(_onset_pred_comp_raw.astype(np.float64),  sigma=_DTW_GAUSS_SIGMA, axis=0)
+                onset_label_comp = gaussian_filter1d(_onset_label_comp_raw.astype(np.float64), sigma=_DTW_GAUSS_SIGMA, axis=0)
+
             print('dtw lengths', len(onset_pred_comp), len(onset_label_comp))
             init_time = time.time()
             alignment = dtw(onset_pred_comp, onset_label_comp, dist_method='euclidean',
@@ -785,11 +822,16 @@ class EMDATASET(Dataset):
                         },
                     }
                     _visualize_notes(viz_dir, seg_key, self._notes_history[seg_key])
-                    _visualize_diag(viz_dir, seg_key,
-                                    onset_pred_comp, onset_label_comp,
-                                    onset_pred_np[:, -N_KEYS:],
-                                    aligned_onsets[:, -N_KEYS:],
-                                    viz_tag, bon_dist=bon_dist)
+                    _visualize_diag(
+                        viz_dir, seg_key,
+                        onset_pred_np[:, -N_KEYS:],
+                        aligned_onsets[:, -N_KEYS:],
+                        viz_tag, bon_dist=bon_dist,
+                        pred_raw=_onset_pred_comp_raw   if _is_adapter else onset_pred_comp,
+                        pred_smooth=onset_pred_comp     if _is_adapter else None,
+                        label_raw=_onset_label_comp_raw if _is_adapter else onset_label_comp,
+                        label_smooth=onset_label_comp   if _is_adapter else None,
+                    )
                     if notes_json_path is not None:
                         try:
                             with open(notes_json_path, 'w') as jf:
