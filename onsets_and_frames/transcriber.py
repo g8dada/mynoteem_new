@@ -210,6 +210,62 @@ def load_weights(model, old_model, n_instruments):
             model.velocity_stack[i].load_state_dict(layer_new.state_dict())
 
 
+# ---------------------------------------------------------------------------
+# SoftDTW helpers (used by AMTAdapter.run_on_batch for the M-step loss)
+# ---------------------------------------------------------------------------
+
+def _compress_across_octave_torch(x):
+    """(T, N_KEYS=88) → (T, 12) via max across 7 octaves. Matches utils.compress_across_octave.
+    Last 4 semitones (MIDI 84-87) are ignored — same as the numpy reference."""
+    T = x.shape[0]
+    n_oct = N_KEYS // 12   # 7 full octaves = 84 keys
+    return x[:, :n_oct * 12].reshape(T, n_oct, 12).max(dim=1).values
+
+
+def _compress_time_torch(x, factor):
+    """(T, 12) → (T//factor, 12) via max in each block. Differentiable."""
+    T = x.shape[0]
+    T_c = T // factor
+    return x[:T_c * factor].reshape(T_c, factor, 12).max(dim=1).values
+
+
+def _soft_dtw_loss(pred_seq, gt_seq, gamma=1.0):
+    """Differentiable softDTW distance, normalized by pred sequence length.
+
+    pred_seq : (T, D)  — requires grad
+    gt_seq   : (Q, D)  — detached label
+    gamma    : smoothness; 0.1 ≈ hard DTW, 10.0 = very smooth
+    Returns softDTW(pred, gt) / T (scalar).
+
+    Uses anti-diagonal parallelism: O(T+Q) outer iterations instead of O(T*Q).
+    """
+    T, Q = pred_seq.shape[0], gt_seq.shape[0]
+    device = pred_seq.device
+
+    cost = torch.cdist(pred_seq.float().unsqueeze(0),
+                       gt_seq.float().detach().unsqueeze(0)).squeeze(0)  # (T, Q)
+
+    INF = float('inf')
+    R = torch.full((T + 1, Q + 1), INF, dtype=torch.float32, device=device)
+    R[0, 0] = 0.0
+
+    for s in range(T + Q - 1):
+        i_lo = max(1, s + 2 - Q)
+        i_hi = min(T, s + 1)
+        ii = torch.arange(i_lo, i_hi + 1, device=device)  # 1-indexed
+        jj = s + 2 - ii                                    # 1-indexed
+
+        r_diag = R[ii - 1, jj - 1]
+        r_up   = R[ii - 1, jj    ]
+        r_left = R[ii,     jj - 1]
+
+        stacked = torch.stack([-r_diag / gamma, -r_up / gamma, -r_left / gamma], dim=1)
+        soft_min = -gamma * torch.logsumexp(stacked, dim=1)
+        R[ii, jj] = cost[ii - 1, jj - 1] + soft_min
+
+    return R[T, Q] / T
+
+
 class AMTAdapter(nn.Module):
     """Wraps EffNetb0 to provide an OnsetsAndFrames-compatible interface for the EM loop.
 
@@ -426,13 +482,17 @@ class AMTAdapter(nn.Module):
         frame_mask = 1. * frame_label * (2. - 1) + 1.
 
         _PRESENCE_POS_WEIGHT = 10.0
-        _SPARSITY_WEIGHT = 0.1   # L1 penalty on frame_pred mean to discourage saturation
+
+        # SoftDTW settings — set _SDTW_GAMMA to 0.1, 1.0, or 10.0 for experiments
+        _SDTW_GAMMA  = 10.0   # 0.1=near-hard DTW, 1.0=standard, 10.0=very smooth
+        _SDTW_WEIGHT = 0.1   # scale relative to BCE losses (~0.3-0.7)
+        unaligned_onset_batch = batch.get('unaligned_onset')  # (B, T, N_KEYS) or None
 
         total_onset = 0.
         total_offset = 0.
         total_frame = 0.
         total_presence = 0.
-        total_sparsity = 0.
+        total_sdtw = 0.
         onset_preds, frame_preds, offset_preds = [], [], []
 
         for b in range(B):
@@ -450,23 +510,30 @@ class AMTAdapter(nn.Module):
             # Fixes the 88-vs-1 class imbalance that collapses onset_logit with per-pitch BCE alone.
             onset_frame_pred = o[..., -N_KEYS:].max(dim=-1).values          # (1, T)
             onset_frame_label = onset_label[b:b+1, :, -N_KEYS:].any(dim=-1).float()  # (1, T)
-            _fw = onset_frame_label * (_PRESENCE_POS_WEIGHT - 1) + 1       # 50 for positives, 1 for negatives
+            _fw = onset_frame_label * (_PRESENCE_POS_WEIGHT - 1) + 1       # 10 for positives, 1 for negatives
             presence_loss = (_fw * F.binary_cross_entropy(
                 onset_frame_pred, onset_frame_label, reduction='none')).mean()
 
-            # L1 sparsity on frame_pred: penalises high activations at every frame to
-            # prevent frame_pred from saturating, which would break note extraction in E-step.
-            sparsity_loss = f[..., -N_KEYS:].mean() * _SPARSITY_WEIGHT
+            # SoftDTW loss: align pred chroma against unaligned MIDI in a differentiable way.
+            # Dense onset_pred → high DTW distance → gradient to be more selective.
+            sdtw_loss = torch.tensor(0.0, device=audio_label.device)
+            if unaligned_onset_batch is not None:
+                gt_chroma = _compress_time_torch(
+                    _compress_across_octave_torch(unaligned_onset_batch[b]), DTW_FACTOR)     # (T_c, 12)
+                if gt_chroma.any():  # skip clips with no unaligned label (all-zero fallback)
+                    pred_chroma = _compress_time_torch(
+                        _compress_across_octave_torch(o.squeeze(0)[..., -N_KEYS:]), DTW_FACTOR)  # (T_c, 12)
+                    sdtw_loss = _soft_dtw_loss(pred_chroma, gt_chroma, gamma=_SDTW_GAMMA) * _SDTW_WEIGHT
 
             # Divide by B so gradient magnitude matches a full-batch average
-            clip_loss = (o_loss + of_loss + f_loss + presence_loss + sparsity_loss) / B
+            clip_loss = (o_loss + of_loss + f_loss + presence_loss + sdtw_loss) / B
             clip_loss.backward()
 
             total_onset += o_loss.item()
             total_offset += of_loss.item()
             total_frame += f_loss.item()
             total_presence += presence_loss.item()
-            total_sparsity += sparsity_loss.item()
+            total_sdtw += sdtw_loss.item()
 
             onset_preds.append(o.detach())
             frame_preds.append(f.detach())
@@ -485,7 +552,7 @@ class AMTAdapter(nn.Module):
             'loss/onset':    torch.tensor(total_onset    / B),
             'loss/offset':   torch.tensor(total_offset   / B),
             'loss/frame':    torch.tensor(total_frame    / B),
-            'loss/presence':  torch.tensor(total_presence  / B),
-            'loss/sparsity':  torch.tensor(total_sparsity  / B),
+            'loss/presence': torch.tensor(total_presence / B),
+            'loss/sdtw':     torch.tensor(total_sdtw     / B),
         }
         return predictions, losses

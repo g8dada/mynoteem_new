@@ -42,7 +42,7 @@ ZS_MODEL_PATH      = '/data/hakka/singing_transcription_ICASSP2021/AST/models/10
 ZS_CACHE_JSON      = '/data/hakka/mynoteem_new/mirst_zeroshot_viz/mirst_zeroshot_results.json'
 GT_JSON            = '/data/hakka/singing_transcription_ICASSP2021/MIR-ST500_20210206/MIR-ST500_corrected.json'
 
-run_dir = 'transcriber-260922-165856-adapter_True'
+run_dir = 'transcriber-261005-014957-adapter_True'
 ADAPTER_MODEL_PATH = f'/data/hakka/mynoteem_new/runs/{run_dir}/transcriber_15.pt'
 OUT_DIR            = f'/data/hakka/mynoteem_new/runs/{run_dir}/test_results'
 

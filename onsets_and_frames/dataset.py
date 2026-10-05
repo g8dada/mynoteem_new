@@ -116,9 +116,9 @@ def _visualize_diag(viz_dir, seg_key, onset_pred_pitch, aligned_onsets_pitch,
 
         chroma_panels = [
             (axes[0], pred_raw,    'Pred  — raw (peak-picked)',              vmax_pred),
-            (axes[1], pred_smooth, 'Pred  — Gaussian smoothed (DTW input)',   vmax_pred),
+            (axes[1], pred_smooth, 'Pred  — keep peak + tails (DTW input)',   vmax_pred),
             (axes[2], label_raw,   'GT    — raw (unaligned MIDI)',            vmax_label),
-            (axes[3], label_smooth,'GT    — Gaussian smoothed (DTW input)',    vmax_label),
+            (axes[3], label_smooth,'GT    — keep peak + tails (DTW input)',    vmax_label),
         ]
         for ax, data, title, vmax in chroma_panels:
             im = ax.imshow(data.T, aspect='auto', origin='lower',
@@ -367,6 +367,20 @@ class EMDATASET(Dataset):
         result['frame'], _ = result['frame'].reshape(new_shape).max(axis=-2)
         result['big_offset'] = result['offset']
         result['offset'], _ = result['offset'].reshape(new_shape).max(axis=-2)
+
+        # Unaligned MIDI onsets for softDTW M-step loss (adapter mode only).
+        # Always included so all batch items have the same keys for default_collate.
+        # Items without unaligned_label get zeros; run_on_batch skips softDTW for those.
+        if 'unaligned_label' in data:
+            ul = data['unaligned_label'][step_begin:step_end, -N_KEYS:].float()
+            if ul.shape[0] < n_steps:
+                pad = torch.zeros(n_steps - ul.shape[0], N_KEYS, dtype=torch.float32)
+                ul = torch.cat([ul, pad], dim=0)
+            result['unaligned_onset'] = (ul == 3).float().to(self.device)
+        else:
+            result['unaligned_onset'] = torch.zeros(n_steps, N_KEYS,
+                                                    dtype=torch.float32, device=self.device)
+
         return result
 
     def load(self, audio_path, tsv_path):
@@ -658,8 +672,13 @@ class EMDATASET(Dataset):
             # so DTW receives one spike per note, matching the sparse GT chroma structure.
             if _is_adapter:
                 _DTW_ONSET_THRESH = 0.05
-                _DTW_FRAME_THRESH = 0.05
                 _DTW_MIN_NOTE_FRAMES = 3
+                # Adaptive frame threshold: 70th percentile of current frame_pred values.
+                # When frame_pred saturates uniformly high, a fixed threshold (e.g. 0.05)
+                # makes frames_bin all-True and sustain tracking never terminates.
+                # The percentile threshold stays relative to the current distribution,
+                # so frames genuinely above average still terminate the sustain correctly.
+                _DTW_FRAME_THRESH = float(np.percentile(frame_pred_np[:, -N_KEYS:], 70))
                 onsets_bin = (onset_pred_np > _DTW_ONSET_THRESH).astype(np.uint8)
                 frames_bin = (frame_pred_np > _DTW_FRAME_THRESH).astype(np.uint8)
                 onset_pred_for_dtw = np.zeros_like(onset_pred_np)
@@ -680,7 +699,8 @@ class EMDATASET(Dataset):
                         t = f_off if f_off > t else t + 1
                 onset_pred_np_for_dtw = onset_pred_for_dtw
                 print(f'adapter note-extract DTW events: {n_extracted} pred, '
-                      f'{int(unaligned_onsets[:, -N_KEYS:].any(axis=1).sum())} gt frames')
+                      f'{int(unaligned_onsets[:, -N_KEYS:].any(axis=1).sum())} gt frames '
+                      f'(frame_thresh={_DTW_FRAME_THRESH:.3f})')
             else:
                 onset_pred_np_for_dtw = onset_pred_np
 
@@ -696,8 +716,8 @@ class EMDATASET(Dataset):
                 _DTW_GAUSS_SIGMA = 2.0  # compressed frames (~192ms at 512 hop, DTW_FACTOR=3)
                 _onset_pred_comp_raw  = onset_pred_comp.copy()
                 _onset_label_comp_raw = onset_label_comp.copy()
-                onset_pred_comp  = gaussian_filter1d(_onset_pred_comp_raw.astype(np.float64),  sigma=_DTW_GAUSS_SIGMA, axis=0)
-                onset_label_comp = gaussian_filter1d(_onset_label_comp_raw.astype(np.float64), sigma=_DTW_GAUSS_SIGMA, axis=0)
+                onset_pred_comp  = np.maximum(gaussian_filter1d(_onset_pred_comp_raw.astype(np.float64),  sigma=_DTW_GAUSS_SIGMA, axis=0), _onset_pred_comp_raw)
+                onset_label_comp = np.maximum(gaussian_filter1d(_onset_label_comp_raw.astype(np.float64), sigma=_DTW_GAUSS_SIGMA, axis=0), _onset_label_comp_raw)
 
             print('dtw lengths', len(onset_pred_comp), len(onset_label_comp))
             init_time = time.time()
