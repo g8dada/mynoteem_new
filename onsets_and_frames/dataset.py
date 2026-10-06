@@ -704,6 +704,21 @@ class EMDATASET(Dataset):
             else:
                 onset_pred_np_for_dtw = onset_pred_np
 
+            # Argmax-pitch fix (adapter only): for each active frame keep only the most
+            # confident pitch, zeroing all others.
+            # The adapter's softmax pitch distribution spreads probability across all 88
+            # pitches, making compressed chroma nearly uniform and DTW alignment poor.
+            # Keeping one pitch per frame concentrates the chroma into a clear spike,
+            # giving DTW the same structured input that OnsetsAndFrames produces naturally.
+            if _is_adapter:
+                active_idx = np.where(onset_pred_np_for_dtw.any(axis=1))[0]
+                if len(active_idx) > 0:
+                    best_pitch = onset_pred_np_for_dtw[active_idx].argmax(axis=1)
+                    argmax_grid = np.zeros_like(onset_pred_np_for_dtw)
+                    argmax_grid[active_idx, best_pitch] = onset_pred_np_for_dtw[active_idx, best_pitch]
+                    onset_pred_np_for_dtw = argmax_grid
+                print(f'argmax-pitch: {len(active_idx)} active frames → 1 pitch each')
+
             # We align based on likelihoods regardless of the octave (chroma features)
             onset_pred_comp = compress_across_octave(onset_pred_np_for_dtw[:, -N_KEYS:])
             onset_label_comp = compress_across_octave(unaligned_onsets[:, -N_KEYS:])

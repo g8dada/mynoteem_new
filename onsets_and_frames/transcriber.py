@@ -485,8 +485,9 @@ class AMTAdapter(nn.Module):
 
         # SoftDTW settings — set _SDTW_GAMMA to 0.1, 1.0, or 10.0 for experiments
         _SDTW_GAMMA  = 10.0   # 0.1=near-hard DTW, 1.0=standard, 10.0=very smooth
-        _SDTW_WEIGHT = 0.1   # scale relative to BCE losses (~0.3-0.7)
-        unaligned_onset_batch = batch.get('unaligned_onset')  # (B, T, N_KEYS) or None
+        _SDTW_WEIGHT = 0   # scale relative to BCE losses (~0.3-0.7)
+        # unaligned_onset_batch = batch.get('unaligned_onset')  # (B, T, N_KEYS) or None
+        unaligned_onset_batch = None  # softDTW disabled
 
         total_onset = 0.
         total_offset = 0.
