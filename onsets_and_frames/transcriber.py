@@ -481,7 +481,7 @@ class AMTAdapter(nn.Module):
         offset_mask = 1. * offset_label * (2. - 1) + 1.
         frame_mask = 1. * frame_label * (2. - 1) + 1.
 
-        _PRESENCE_POS_WEIGHT = 10.0
+        _PRESENCE_POS_WEIGHT = 2.0
 
         # SoftDTW settings — set _SDTW_GAMMA to 0.1, 1.0, or 10.0 for experiments
         _SDTW_GAMMA  = 10.0   # 0.1=near-hard DTW, 1.0=standard, 10.0=very smooth

@@ -719,6 +719,28 @@ class EMDATASET(Dataset):
                     onset_pred_np_for_dtw = argmax_grid
                 print(f'argmax-pitch: {len(active_idx)} active frames → 1 pitch each')
 
+            # Top-K global selection (adapter only): keep only the K highest onset_pp
+            # values globally, zeroing all others.
+            # K = _K_FACTOR × n_gt_events, so even when onset_pp saturates uniformly high
+            # the relative ordering still identifies the most confident onset candidates,
+            # directly capping n_pred_events at a level comparable to n_gt.
+            if _is_adapter:
+                _K_FACTOR = 3
+                n_gt_events = int(unaligned_onsets[:, -N_KEYS:].any(axis=1).sum())
+                K = max(n_gt_events * _K_FACTOR, 10)
+                flat_vals = onset_pred_np_for_dtw.flatten()
+                nonzero_flat_idx = np.where(flat_vals > 0)[0]
+                n_nonzero = len(nonzero_flat_idx)
+                if n_nonzero > K:
+                    top_k_rel = np.argpartition(flat_vals[nonzero_flat_idx], -K)[-K:]
+                    top_k_flat_idx = nonzero_flat_idx[top_k_rel]
+                    topk_grid = np.zeros_like(onset_pred_np_for_dtw)
+                    t_idx, k_idx = np.unravel_index(top_k_flat_idx, onset_pred_np_for_dtw.shape)
+                    topk_grid[t_idx, k_idx] = onset_pred_np_for_dtw[t_idx, k_idx]
+                    onset_pred_np_for_dtw = topk_grid
+                print(f'top-K: kept {min(n_nonzero, K)} of {n_nonzero} pred events '
+                      f'(K={K}, n_gt={n_gt_events}, factor={_K_FACTOR})')
+
             # We align based on likelihoods regardless of the octave (chroma features)
             onset_pred_comp = compress_across_octave(onset_pred_np_for_dtw[:, -N_KEYS:])
             onset_label_comp = compress_across_octave(unaligned_onsets[:, -N_KEYS:])
