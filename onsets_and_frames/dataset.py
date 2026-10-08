@@ -541,6 +541,21 @@ class EMDATASET(Dataset):
         _inner = transcriber.module if isinstance(transcriber, DataParallel) else transcriber
         _is_adapter = isinstance(_inner, AMTAdapter)
 
+        # The E-step is pure inference, so force the model into eval() mode:
+        #   - BatchNorm then normalises with the pretrained running_mean/var instead
+        #     of per-batch statistics. In train() mode the adapter's EffNet BN layers
+        #     would make each clip's prediction depend on its batch-mates, and would
+        #     overwrite the pretrained running stats on every forward (no_grad does
+        #     NOT prevent that update) — corrupting the backbone over the EM loop.
+        #   - Dropout is disabled, so pseudo-labels are deterministic.
+        # Scoped to the adapter path to keep adapter_mode=False byte-identical to the
+        # original pipeline. _inner is the underlying module shared by both the raw
+        # transcriber and its DataParallel wrapper, so this covers every inference
+        # site below (batched E-step, per-clip fallback, and long-audio split).
+        _restore_train = _is_adapter and _inner.training
+        if _is_adapter:
+            _inner.eval()
+
         # --- Batched GPU inference for adapter E-step -------------------------
         # Pre-compute onset/frame predictions for all #0 clips in mini-batches,
         # then do the CPU-heavy DTW alignment sequentially below.  Results are
@@ -672,13 +687,8 @@ class EMDATASET(Dataset):
             # so DTW receives one spike per note, matching the sparse GT chroma structure.
             if _is_adapter:
                 _DTW_ONSET_THRESH = 0.05
+                _DTW_FRAME_THRESH = 0.5
                 _DTW_MIN_NOTE_FRAMES = 3
-                # Adaptive frame threshold: 70th percentile of current frame_pred values.
-                # When frame_pred saturates uniformly high, a fixed threshold (e.g. 0.05)
-                # makes frames_bin all-True and sustain tracking never terminates.
-                # The percentile threshold stays relative to the current distribution,
-                # so frames genuinely above average still terminate the sustain correctly.
-                _DTW_FRAME_THRESH = float(np.percentile(frame_pred_np[:, -N_KEYS:], 70))
                 onsets_bin = (onset_pred_np > _DTW_ONSET_THRESH).astype(np.uint8)
                 frames_bin = (frame_pred_np > _DTW_FRAME_THRESH).astype(np.uint8)
                 onset_pred_for_dtw = np.zeros_like(onset_pred_np)
@@ -699,47 +709,9 @@ class EMDATASET(Dataset):
                         t = f_off if f_off > t else t + 1
                 onset_pred_np_for_dtw = onset_pred_for_dtw
                 print(f'adapter note-extract DTW events: {n_extracted} pred, '
-                      f'{int(unaligned_onsets[:, -N_KEYS:].any(axis=1).sum())} gt frames '
-                      f'(frame_thresh={_DTW_FRAME_THRESH:.3f})')
+                      f'{int(unaligned_onsets[:, -N_KEYS:].any(axis=1).sum())} gt frames')
             else:
                 onset_pred_np_for_dtw = onset_pred_np
-
-            # Argmax-pitch fix (adapter only): for each active frame keep only the most
-            # confident pitch, zeroing all others.
-            # The adapter's softmax pitch distribution spreads probability across all 88
-            # pitches, making compressed chroma nearly uniform and DTW alignment poor.
-            # Keeping one pitch per frame concentrates the chroma into a clear spike,
-            # giving DTW the same structured input that OnsetsAndFrames produces naturally.
-            if _is_adapter:
-                active_idx = np.where(onset_pred_np_for_dtw.any(axis=1))[0]
-                if len(active_idx) > 0:
-                    best_pitch = onset_pred_np_for_dtw[active_idx].argmax(axis=1)
-                    argmax_grid = np.zeros_like(onset_pred_np_for_dtw)
-                    argmax_grid[active_idx, best_pitch] = onset_pred_np_for_dtw[active_idx, best_pitch]
-                    onset_pred_np_for_dtw = argmax_grid
-                print(f'argmax-pitch: {len(active_idx)} active frames → 1 pitch each')
-
-            # Top-K global selection (adapter only): keep only the K highest onset_pp
-            # values globally, zeroing all others.
-            # K = _K_FACTOR × n_gt_events, so even when onset_pp saturates uniformly high
-            # the relative ordering still identifies the most confident onset candidates,
-            # directly capping n_pred_events at a level comparable to n_gt.
-            if _is_adapter:
-                _K_FACTOR = 3
-                n_gt_events = int(unaligned_onsets[:, -N_KEYS:].any(axis=1).sum())
-                K = max(n_gt_events * _K_FACTOR, 10)
-                flat_vals = onset_pred_np_for_dtw.flatten()
-                nonzero_flat_idx = np.where(flat_vals > 0)[0]
-                n_nonzero = len(nonzero_flat_idx)
-                if n_nonzero > K:
-                    top_k_rel = np.argpartition(flat_vals[nonzero_flat_idx], -K)[-K:]
-                    top_k_flat_idx = nonzero_flat_idx[top_k_rel]
-                    topk_grid = np.zeros_like(onset_pred_np_for_dtw)
-                    t_idx, k_idx = np.unravel_index(top_k_flat_idx, onset_pred_np_for_dtw.shape)
-                    topk_grid[t_idx, k_idx] = onset_pred_np_for_dtw[t_idx, k_idx]
-                    onset_pred_np_for_dtw = topk_grid
-                print(f'top-K: kept {min(n_nonzero, K)} of {n_nonzero} pred events '
-                      f'(K={K}, n_gt={n_gt_events}, factor={_K_FACTOR})')
 
             # We align based on likelihoods regardless of the octave (chroma features)
             onset_pred_comp = compress_across_octave(onset_pred_np_for_dtw[:, -N_KEYS:])
@@ -747,14 +719,6 @@ class EMDATASET(Dataset):
             # We can do DTW on super-frames since anyway we search for local max afterwards
             onset_pred_comp = compress_time(onset_pred_comp, DTW_FACTOR)
             onset_label_comp = compress_time(onset_label_comp, DTW_FACTOR)
-
-            if _is_adapter:
-                from scipy.ndimage import gaussian_filter1d
-                _DTW_GAUSS_SIGMA = 2.0  # compressed frames (~192ms at 512 hop, DTW_FACTOR=3)
-                _onset_pred_comp_raw  = onset_pred_comp.copy()
-                _onset_label_comp_raw = onset_label_comp.copy()
-                onset_pred_comp  = np.maximum(gaussian_filter1d(_onset_pred_comp_raw.astype(np.float64),  sigma=_DTW_GAUSS_SIGMA, axis=0), _onset_pred_comp_raw)
-                onset_label_comp = np.maximum(gaussian_filter1d(_onset_label_comp_raw.astype(np.float64), sigma=_DTW_GAUSS_SIGMA, axis=0), _onset_label_comp_raw)
 
             print('dtw lengths', len(onset_pred_comp), len(onset_label_comp))
             init_time = time.time()
@@ -884,10 +848,10 @@ class EMDATASET(Dataset):
                         onset_pred_np[:, -N_KEYS:],
                         aligned_onsets[:, -N_KEYS:],
                         viz_tag, bon_dist=bon_dist,
-                        pred_raw=_onset_pred_comp_raw   if _is_adapter else onset_pred_comp,
-                        pred_smooth=onset_pred_comp     if _is_adapter else None,
-                        label_raw=_onset_label_comp_raw if _is_adapter else onset_label_comp,
-                        label_smooth=onset_label_comp   if _is_adapter else None,
+                        pred_raw=onset_pred_comp,
+                        pred_smooth=None,
+                        label_raw=onset_label_comp,
+                        label_smooth=None,
                     )
                     if notes_json_path is not None:
                         try:
@@ -966,6 +930,10 @@ class EMDATASET(Dataset):
             del frame_pred
             del velocity_pred
             torch.cuda.empty_cache()
+
+        # Restore the train/eval mode the model had on entry (see eval() above).
+        if _restore_train:
+            _inner.train()
 
     '''
         Update labels. Use only alignment without pseudo-labels.

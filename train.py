@@ -157,6 +157,16 @@ def train(logdir, device, iterations, checkpoint_interval, batch_size, sequence_
 
         total_loss = []
         transcriber.train()
+        if adapter_mode:
+            # Keep the pretrained backbone's BatchNorm in eval() during the M-step:
+            #   - running_mean/var stay fixed (no drift under noisy pseudo-labels,
+            #     and no incoherent stat updates on the weight-frozen early blocks),
+            #   - normalization matches the E-step (which also runs in eval), so we
+            #     optimize exactly the model that generated the labels.
+            # Weights and affine gamma/beta still train; dropout stays active.
+            for _m in transcriber.backbone.modules():
+                if isinstance(_m, torch.nn.modules.batchnorm._BatchNorm):
+                    _m.eval()
 
         onset_total_tp = 0.
         onset_total_pp = 0.

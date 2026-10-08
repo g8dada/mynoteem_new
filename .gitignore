@@ -8,6 +8,7 @@ __pycache__/
 data/
 logs/
 test_zeroshot/
+test_zeroshot_new/
 
 # Training run outputs (large checkpoints and MIDI alignments)
 runs/

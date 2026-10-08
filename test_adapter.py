@@ -26,7 +26,7 @@ import matplotlib.patches as mpatches
 import numpy as np
 import soundfile
 import torch
-from collections import defaultdict
+from collections import Counter, defaultdict
 from tqdm import tqdm
 
 import mir_eval
@@ -39,11 +39,11 @@ from onsets_and_frames.utils import get_peaks
 # ─── Paths ────────────────────────────────────────────────────────────────────
 AUDIO_DIR          = '/data/hakka/mynoteem_new/data/mirst500_15sec_data_full_quantized_NoteEM_audio'
 ZS_MODEL_PATH      = '/data/hakka/singing_transcription_ICASSP2021/AST/models/1005_e_4'
-ZS_CACHE_JSON      = '/data/hakka/mynoteem_new/mirst_zeroshot_viz/mirst_zeroshot_results.json'
+ZS_CACHE_JSON      = '/data/hakka/mynoteem_new/test_zeroshot/mirst_zeroshot_results.json'
 GT_JSON            = '/data/hakka/singing_transcription_ICASSP2021/MIR-ST500_20210206/MIR-ST500_corrected.json'
 
 run_dir = 'transcriber-261005-014957-adapter_True'
-ADAPTER_MODEL_PATH = f'/data/hakka/mynoteem_new/runs/{run_dir}/transcriber_15.pt'
+ADAPTER_MODEL_PATH = f'/data/hakka/mynoteem_new/runs/{run_dir}/transcriber_15.pt'   # epoch 15 checkpoint
 OUT_DIR            = f'/data/hakka/mynoteem_new/runs/{run_dir}/test_results'
 
 # ─── Hyper-parameters ─────────────────────────────────────────────────────────
@@ -51,8 +51,8 @@ SEGMENT_HOP     = 15.0   # seconds (must match preprocess_mirst500.py)
 MIN_NOTE_FRAMES = 3      # ~96 ms at 31.25 fps
 
 # Both adapter and zero-shot use AMTAdapter with the same low thresholds
-ONSET_THR  = 0.05
-FRAME_THR  = 0.05
+ONSET_THR   = 0.05
+OFFSET_THR  = 0.5
 
 ONSET_TOL  = 0.05   # 50 ms
 OFFSET_TOL = 0.05   # 50 ms
@@ -126,49 +126,61 @@ def _load_audio(flac_path):
 
 
 def predict_amtadapter(model, flac_path):
-    """Shared inference for any AMTAdapter model: CQT + audio → (onset_np, frame_np)."""
+    """Shared inference for any AMTAdapter model: CQT + audio → (onset_np, offset_np, frame_np)."""
     audio_raw   = _load_audio(flac_path)
     audio_short = torch.ShortTensor(audio_raw)
     cqt         = _compute_cqt(audio_short)
     audio_f     = audio_short.float() / 32768.0
     with torch.no_grad():
-        onset_pred, _, _, frame_pred, _ = model(
+        onset_pred, offset_pred, _, frame_pred, _ = model(
             audio_f.unsqueeze(0).cuda(),
             cqt=cqt.unsqueeze(0).cuda(),
         )
-    onset_np = onset_pred.squeeze(0).cpu().numpy()   # (T, 88)
-    frame_np = frame_pred.squeeze(0).cpu().numpy()
-    return onset_np, frame_np
+    onset_np  = onset_pred.squeeze(0).cpu().numpy()   # (T, 88)
+    offset_np = offset_pred.squeeze(0).cpu().numpy()  # (T, 88)
+    frame_np  = frame_pred.squeeze(0).cpu().numpy()   # (T, 88)
+    return onset_np, offset_np, frame_np
 
 
-def extract_notes(onset_np, frame_np, is_last_seg):
-    """Per-pitch scan; jumps past each note to avoid mid-note re-triggers."""
-    onset_t   = torch.from_numpy(onset_np)
-    peaks     = get_peaks(onset_t, win_size=3)
-    onset_pkd = onset_np.copy()
-    onset_pkd[~peaks.numpy()] = 0.0
+def extract_notes(onset_np, offset_np, frame_np, is_last_seg):
+    """Monophonic decoding matching test_mirst_zeroshot.py:
+    global onset peak-detection, per-frame argmax pitch with majority vote, offset termination.
+    """
+    onset_global = onset_np.max(axis=1)                              # (T,)
+    peaks_1d = get_peaks(
+        torch.from_numpy(onset_global[:, None]), win_size=3
+    )[:, 0].numpy()                                                  # (T,) bool
+    onset_active = (onset_global * peaks_1d) > ONSET_THR            # (T,)
+    offset_sig   = offset_np[:, 0] > OFFSET_THR                     # (T,)
 
-    onsets_bin = (onset_pkd > ONSET_THR).astype(np.uint8)
-    frames_bin = (frame_np  > FRAME_THR).astype(np.uint8)
-
-    T, P        = onsets_bin.shape
-    fps         = SAMPLE_RATE / HOP_LENGTH
+    T   = onset_np.shape[0]
+    fps = SAMPLE_RATE / HOP_LENGTH
     primary_end = int(SEGMENT_HOP * fps) if not is_last_seg else T
 
-    notes = []
-    for pitch in range(P):
-        t = 0
-        while t < primary_end:
-            if not onsets_bin[t, pitch]:
-                t += 1
-                continue
-            f_on = t; f_off = t
-            while f_off < T and (onsets_bin[f_off, pitch] or frames_bin[f_off, pitch]):
-                f_off += 1
-            if f_off - f_on >= MIN_NOTE_FRAMES:
-                notes.append((round(f_on / fps, 6), round(f_off / fps, 6), pitch + MIN_MIDI))
-            t = f_off if f_off > t else t + 1
+    notes       = []
+    cur_onset   = None
+    pitch_votes = []
 
+    def _flush(end_frame):
+        if cur_onset is None or end_frame - cur_onset < MIN_NOTE_FRAMES or not pitch_votes:
+            return
+        best = Counter(pitch_votes).most_common(1)[0][0]
+        notes.append((round(cur_onset / fps, 6), round(end_frame / fps, 6), best + MIN_MIDI))
+
+    for t in range(primary_end):
+        if onset_active[t]:
+            _flush(t)
+            cur_onset   = t
+            pitch_votes = [int(np.argmax(frame_np[t]))]
+        elif offset_sig[t]:
+            _flush(t)
+            cur_onset   = None
+            pitch_votes = []
+        else:
+            if cur_onset is not None:
+                pitch_votes.append(int(np.argmax(frame_np[t])))
+
+    _flush(primary_end)
     notes.sort()
     return notes
 
@@ -181,11 +193,11 @@ def run_inference(model, segments, last_seg_of, label):
         seg_start = seg_idx * SEGMENT_HOP
         is_last   = (seg_idx == last_seg_of[sid])
         try:
-            onset_np, frame_np = predict_amtadapter(model, flac_path)
+            onset_np, offset_np, frame_np = predict_amtadapter(model, flac_path)
         except Exception as e:
             print(f'  Warning – skipping {flac_path}: {e}')
             continue
-        for on_rel, off_rel, midi in extract_notes(onset_np, frame_np, is_last):
+        for on_rel, off_rel, midi in extract_notes(onset_np, offset_np, frame_np, is_last):
             song_pred[sid].append((
                 round(seg_start + on_rel,  6),
                 round(seg_start + off_rel, 6),
