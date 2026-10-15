@@ -2,7 +2,7 @@
 
 Models compared:
   - NoteEM  : OnsetsAndFrames checkpoint trained via the EM loop (epoch 15)
-  - ZeroShot: EffNetb0 (AST) wrapped in AMTAdapter, no fine-tuning
+  - ZeroShot: EffNetb0 (AST) wrapped in AMTAdapter, no fine-tuning (loaded from ZS_CACHE_JSON)
 
 Both models run on the same #0 (unshifted) segments from
 mirst500_15sec_data_full_quantized_NoteEM_audio and are evaluated against the
@@ -26,33 +26,35 @@ import matplotlib.patches as mpatches
 import numpy as np
 import soundfile
 import torch
-from collections import defaultdict
+from collections import Counter, defaultdict
 from tqdm import tqdm
 
 import mir_eval
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from onsets_and_frames.constants import HOP_LENGTH, MIN_MIDI, N_KEYS, SAMPLE_RATE
-from onsets_and_frames.dataset import _compute_cqt
 from onsets_and_frames.mel import melspectrogram
 from onsets_and_frames.utils import get_peaks
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 AUDIO_DIR        = '/data/hakka/mynoteem_new/data/mirst500_15sec_data_full_quantized_NoteEM_audio'
-NOTEM_MODEL_PATH = '/data/hakka/mynoteem_new/runs/transcriber-260908-192344/transcriber_15.pt'
-ZS_MODEL_PATH    = '/data/hakka/singing_transcription_ICASSP2021/AST/models/1005_e_4'
+ZS_CACHE_JSON    = '/data/hakka/mynoteem_new/test_zeroshot/mirst_zeroshot_results.json'
 GT_JSON          = '/data/hakka/singing_transcription_ICASSP2021/MIR-ST500_20210206/MIR-ST500_corrected.json'
-OUT_DIR          = '/data/hakka/mynoteem_new/test_original_results'
+
+run_dir = os.environ.get('RUN_DIR', 'transcriber-261012-174522-adapter_False')
+NOTEM_MODEL_PATH = os.environ.get(
+    'NOTEM_MODEL_PATH',
+    f'/data/hakka/mynoteem_new/runs/{run_dir}/transcriber_15.pt')   # epoch 15 checkpoint
+OUT_DIR          = f'/data/hakka/mynoteem_new/runs/{run_dir}/test_results'
 
 # ─── Hyper-parameters ─────────────────────────────────────────────────────────
-SEGMENT_HOP    = 15.0   # seconds (must match preprocess_mirst500.py)
-MIN_NOTE_FRAMES = 3     # ~96 ms at 31.25 fps
+SEGMENT_HOP     = 15.0   # seconds (must match preprocess_mirst500.py)
+MIN_NOTE_FRAMES = 3      # ~96 ms at 31.25 fps
 
-# Per-model thresholds
-NOTEM_ONSET_THR = 0.5
-NOTEM_FRAME_THR = 0.5
-ZS_ONSET_THR    = 0.05   # low threshold needed for AMTAdapter product formula
-ZS_FRAME_THR    = 0.05
+# NoteEM onset/offset are true per-pitch sigmoids reaching ~1.0, so they need a much
+# higher threshold than the AMTAdapter product formula (which is capped ~0.2).
+NOTEM_ONSET_THR  = 0.5
+NOTEM_OFFSET_THR = 0.5
 
 ONSET_TOL  = 0.05   # 50 ms
 OFFSET_TOL = 0.05   # 50 ms
@@ -65,15 +67,29 @@ def load_notem_model():
     return model.cuda().eval()
 
 
-def load_zeroshot_model():
-    from onsets_and_frames.ast_model import EffNetb0
-    from onsets_and_frames.transcriber import AMTAdapter
-    backbone = EffNetb0()
-    backbone.load_state_dict(
-        torch.load(ZS_MODEL_PATH, map_location='cpu', weights_only=False),
-        strict=False,
-    )
-    return AMTAdapter(backbone).cuda().eval()
+def load_zs_from_cache(path):
+    """Load pre-extracted zero-shot notes (monophonic decode) from ZS_CACHE_JSON.
+
+    The cache is keyed 'mirst_{sid}_seg{i}' with segment-relative notes in
+    entry['pred'] = [[on_rel, off_rel, midi], ...]; we offset them back to
+    absolute song time and group by song id.
+    """
+    with open(path) as f:
+        data = json.load(f)
+    zs_pred = defaultdict(list)
+    for seg_key, entry in data.items():           # 'mirst_{sid}_seg{i}'
+        m = re.match(r'^mirst_(\d+)_seg(\d+)$', seg_key)
+        if m is None:
+            continue
+        sid    = m.group(1)
+        offset = int(m.group(2)) * SEGMENT_HOP
+        for on_rel, off_rel, midi in entry.get('pred', []):
+            zs_pred[sid].append((round(on_rel + offset, 6),
+                                 round(off_rel + offset, 6),
+                                 midi))
+    for sid in zs_pred:
+        zs_pred[sid].sort()
+    return zs_pred
 
 
 # ─── Segment discovery ────────────────────────────────────────────────────────
@@ -106,80 +122,86 @@ def _load_audio(flac_path):
 
 
 def predict_notem(model, flac_path):
-    """OnsetsAndFrames: mel → forward → (onset_np, frame_np) as (T, 88)."""
+    """OnsetsAndFrames: mel → forward → (onset_np, offset_np, frame_np) as (T, 88)."""
     audio_raw = _load_audio(flac_path)
     audio_t = torch.ShortTensor(audio_raw).float() / 32768.0
     with torch.no_grad():
         mel = melspectrogram(audio_t.unsqueeze(0).cuda()[:, :-1]).transpose(-1, -2)
-        onset_pred, _, _, frame_pred, _ = model(mel)
-    onset_np = onset_pred.squeeze(0).cpu().numpy()
-    if onset_np.shape[-1] > N_KEYS:      # n_instruments=2 → 176 cols; take pitch-only
+        onset_pred, offset_pred, _, frame_pred, _ = model(mel)
+    onset_np  = onset_pred.squeeze(0).cpu().numpy()
+    offset_np = offset_pred.squeeze(0).cpu().numpy()
+    frame_np  = frame_pred.squeeze(0).cpu().numpy()
+    # n_instruments > 1 → onset has output_features * n_instruments cols; take the
+    # pitch-only head (last N_KEYS, matching train.py's `-N_KEYS:` metric slice).
+    if onset_np.shape[-1] > N_KEYS:
         onset_np = onset_np[:, -N_KEYS:]
-    frame_np = frame_pred.squeeze(0).cpu().numpy()
-    return onset_np, frame_np
+    if offset_np.shape[-1] > N_KEYS:
+        offset_np = offset_np[:, -N_KEYS:]
+    if frame_np.shape[-1] > N_KEYS:
+        frame_np = frame_np[:, -N_KEYS:]
+    return onset_np, offset_np, frame_np
 
 
-def predict_zeroshot(model, flac_path):
-    """AMTAdapter: CQT + audio → forward → (onset_np, frame_np) as (T, 88)."""
-    audio_raw = _load_audio(flac_path)
-    audio_short = torch.ShortTensor(audio_raw)
-    cqt     = _compute_cqt(audio_short)
-    audio_f = audio_short.float() / 32768.0
-    with torch.no_grad():
-        onset_pred, _, _, frame_pred, _ = model(
-            audio_f.unsqueeze(0).cuda(),
-            cqt=cqt.unsqueeze(0).cuda(),
-        )
-    onset_np = onset_pred.squeeze(0).cpu().numpy()
-    frame_np = frame_pred.squeeze(0).cpu().numpy()
-    return onset_np, frame_np
+def extract_notes(onset_np, offset_np, frame_np, is_last_seg, onset_thr, offset_thr):
+    """Monophonic decoding matching test_adapter.py / test_mirst_zeroshot.py:
+    global onset peak-detection, per-frame argmax pitch with majority vote, offset termination.
 
+    Unlike the AMTAdapter (which broadcasts one scalar offset across all 88 keys), the
+    OnsetsAndFrames offset head is genuinely per-pitch, so the global offset signal is the
+    max over pitches rather than offset_np[:, 0].
+    """
+    onset_global = onset_np.max(axis=1)                              # (T,)
+    peaks_1d = get_peaks(
+        torch.from_numpy(onset_global[:, None]), win_size=3
+    )[:, 0].numpy()                                                  # (T,) bool
+    onset_active = (onset_global * peaks_1d) > onset_thr            # (T,)
+    offset_sig   = offset_np.max(axis=1) > offset_thr              # (T,)
 
-def extract_notes(onset_np, frame_np, is_last_seg, onset_thr, frame_thr):
-    """Per-pitch scan; jumps past each note to avoid mid-note re-triggers."""
-    onset_t   = torch.from_numpy(onset_np)
-    peaks     = get_peaks(onset_t, win_size=3)
-    onset_pkd = onset_np.copy()
-    onset_pkd[~peaks.numpy()] = 0.0
-
-    onsets_bin = (onset_pkd > onset_thr).astype(np.uint8)
-    frames_bin = (frame_np  > frame_thr).astype(np.uint8)
-
-    T, P        = onsets_bin.shape
-    fps         = SAMPLE_RATE / HOP_LENGTH
+    T   = onset_np.shape[0]
+    fps = SAMPLE_RATE / HOP_LENGTH
     primary_end = int(SEGMENT_HOP * fps) if not is_last_seg else T
 
-    notes = []
-    for pitch in range(P):
-        t = 0
-        while t < primary_end:
-            if not onsets_bin[t, pitch]:
-                t += 1
-                continue
-            f_on = t; f_off = t
-            while f_off < T and (onsets_bin[f_off, pitch] or frames_bin[f_off, pitch]):
-                f_off += 1
-            if f_off - f_on >= MIN_NOTE_FRAMES:
-                notes.append((round(f_on / fps, 6), round(f_off / fps, 6), pitch + MIN_MIDI))
-            t = f_off if f_off > t else t + 1
+    notes       = []
+    cur_onset   = None
+    pitch_votes = []
 
+    def _flush(end_frame):
+        if cur_onset is None or end_frame - cur_onset < MIN_NOTE_FRAMES or not pitch_votes:
+            return
+        best = Counter(pitch_votes).most_common(1)[0][0]
+        notes.append((round(cur_onset / fps, 6), round(end_frame / fps, 6), best + MIN_MIDI))
+
+    for t in range(primary_end):
+        if onset_active[t]:
+            _flush(t)
+            cur_onset   = t
+            pitch_votes = [int(np.argmax(frame_np[t]))]
+        elif offset_sig[t]:
+            _flush(t)
+            cur_onset   = None
+            pitch_votes = []
+        else:
+            if cur_onset is not None:
+                pitch_votes.append(int(np.argmax(frame_np[t])))
+
+    _flush(primary_end)
     notes.sort()
     return notes
 
 
 # ─── Inference loop ───────────────────────────────────────────────────────────
 
-def run_inference(model, predict_fn, onset_thr, frame_thr, segments, last_seg_of, label):
+def run_inference(model, onset_thr, offset_thr, segments, last_seg_of, label):
     song_pred = defaultdict(list)
     for sid, seg_idx, flac_path in tqdm(segments, desc=f'Inference [{label}]'):
         seg_start = seg_idx * SEGMENT_HOP
         is_last   = (seg_idx == last_seg_of[sid])
         try:
-            onset_np, frame_np = predict_fn(model, flac_path)
+            onset_np, offset_np, frame_np = predict_notem(model, flac_path)
         except Exception as e:
             print(f'  Warning – skipping {flac_path}: {e}')
             continue
-        for on_rel, off_rel, midi in extract_notes(onset_np, frame_np, is_last, onset_thr, frame_thr):
+        for on_rel, off_rel, midi in extract_notes(onset_np, offset_np, frame_np, is_last, onset_thr, offset_thr):
             song_pred[sid].append((
                 round(seg_start + on_rel,  6),
                 round(seg_start + off_rel, 6),
@@ -344,8 +366,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--limit', type=int, default=None,
                         help='Process only first N segments (quick smoke-test)')
-    parser.add_argument('--skip-zeroshot', action='store_true',
-                        help='Re-use cached zeroshot results from JSON if present')
+    parser.add_argument('--zs-json', default=ZS_CACHE_JSON,
+                        help='Path to mirst_zeroshot_results.json (default: ZS_CACHE_JSON)')
     args = parser.parse_args()
 
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -368,38 +390,16 @@ def main():
     print('\nLoading NoteEM model...')
     notem_model = load_notem_model()
     notem_pred  = run_inference(
-        notem_model, predict_notem,
-        NOTEM_ONSET_THR, NOTEM_FRAME_THR,
+        notem_model,
+        NOTEM_ONSET_THR, NOTEM_OFFSET_THR,
         segments, last_seg_of, 'NoteEM',
     )
     del notem_model
     torch.cuda.empty_cache()
 
-    # ── Zero-shot inference ────────────────────────────────────────────────────
-    cached_json = os.path.join(OUT_DIR, 'results.json')
-    zs_pred = None
-
-    if args.skip_zeroshot and os.path.isfile(cached_json):
-        print('\nLoading cached zero-shot predictions from results.json ...')
-        with open(cached_json) as f:
-            prev = json.load(f)
-        if 'zeroshot_per_song' in prev:
-            # rebuild song_pred from per-song note lists stored in JSON
-            zs_pred = defaultdict(list)
-            for sid, entry in prev['zeroshot_per_song'].items():
-                for n in entry.get('pred_notes', []):
-                    zs_pred[sid].append(tuple(n))
-
-    if zs_pred is None:
-        print('\nLoading ZeroShot model...')
-        zs_model = load_zeroshot_model()
-        zs_pred  = run_inference(
-            zs_model, predict_zeroshot,
-            ZS_ONSET_THR, ZS_FRAME_THR,
-            segments, last_seg_of, 'ZeroShot',
-        )
-        del zs_model
-        torch.cuda.empty_cache()
+    # ── Zero-shot predictions (pre-extracted, loaded from cache) ─────────────────
+    print(f'\nLoading ZS predictions from {args.zs_json} ...')
+    zs_pred = load_zs_from_cache(args.zs_json)
 
     # ── Evaluate ───────────────────────────────────────────────────────────────
     print('\nEvaluating NoteEM...')
@@ -410,10 +410,7 @@ def main():
     zs_per_song = evaluate_all(zs_pred, gt_data)
     print(f'  Evaluated {len(zs_per_song)} songs.')
 
-    notem_summary = aggregate(notem_per_song)
-    zs_summary    = aggregate(zs_per_song)
-
-    # Use the union of songs evaluated by both models for a fair common set
+    # Use the intersection of songs evaluated by both models for a fair common set
     common_sids = sorted(set(notem_per_song) & set(zs_per_song), key=int)
     notem_common = {s: notem_per_song[s] for s in common_sids}
     zs_common    = {s: zs_per_song[s]    for s in common_sids}
@@ -433,7 +430,7 @@ def main():
         print()
 
     # ── Save JSON ──────────────────────────────────────────────────────────────
-    # Store pred notes per song so --skip-zeroshot can reload them next time
+    # Store per-song zero-shot pred notes alongside their scores
     zs_pred_serialisable = {
         sid: {'pred_notes': list(map(list, notes))}
         for sid, notes in zs_pred.items()

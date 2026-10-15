@@ -1,4 +1,5 @@
 import os
+import random
 from datetime import datetime
 import numpy as np
 from sacred import Experiment
@@ -32,6 +33,17 @@ def config():
     multi_ckpt = False # Flag if the ckpt was trained on pitch only or instrument-sensitive. The provided checkpoints were trained on pitch only.
     visualize = True  # save piano-roll PNGs and notes_log.json each epoch
     gt_json_path = '/data/hakka/singing_transcription_ICASSP2021/MIR-ST500_20210206/MIR-ST500_corrected.json'
+    max_groups = None  # limit # of training groups (None = all); set small for fast change-validation runs
+    random_seed = 42   # pin all RNGs so A/B runs differ only by the intended change, not data order
+
+    # Adapter EM-loop knobs. Exported to env vars in train() so the E-step (dataset) and M-step
+    # (transcriber) pick them up; defaults fall back to the env var for backward compat; and being
+    # config params they are logged to config.json and settable via `with DURATION_DTW=1`.
+    USE_FOCAL      = int(os.environ.get('USE_FOCAL', 0))           # 1 = focal onset/offset loss; 0 = pos-weighted BCE (adapter only)
+    POS_WEIGHT     = float(os.environ.get('POS_WEIGHT', 20))       # BCE positive weight for onset/offset when USE_FOCAL=0 (adapter only)
+    FOCAL_ALPHA    = float(os.environ.get('FOCAL_ALPHA', 0.4))     # onset/offset focal-loss alpha when USE_FOCAL=1 (adapter only)
+    DURATION_DTW   = int(os.environ.get('DURATION_DTW', 0))        # 1 = duration-aware DTW offsets (adapter only)
+    DURATION_DTW_W = float(os.environ.get('DURATION_DTW_W', 0.5))  # sustain weight in the DTW feature (adapter only)
 
     # transcriber_ckpt = 'ckpts/'
     # multi_ckpt = True
@@ -41,7 +53,7 @@ def config():
     batch_size = 8
     sequence_length = SEQ_LEN #if HOP_LENGTH == 512 else 3 * SEQ_LEN // 4
 
-    iterations = 1592 # per epoch, 1000 initially
+    iterations = None # per epoch; None = auto (~1 pass/epoch based on dataset size). Full set -> 1592.
     learning_rate = 0.00001
     learning_rate_decay_steps = 10000
     clip_gradient_norm = False #3
@@ -52,11 +64,32 @@ def config():
 
 @ex.automain
 def train(logdir, device, iterations, checkpoint_interval, batch_size, sequence_length, learning_rate, learning_rate_decay_steps,
-          clip_gradient_norm, epochs, transcriber_ckpt, multi_ckpt, adapter_mode, visualize, gt_json_path):
+          clip_gradient_norm, epochs, transcriber_ckpt, multi_ckpt, adapter_mode, visualize, gt_json_path, max_groups,
+          random_seed, USE_FOCAL, POS_WEIGHT, FOCAL_ALPHA, DURATION_DTW, DURATION_DTW_W):
 
     print_config(ex.current_run)
     os.makedirs(logdir, exist_ok=True)
-    
+
+    # Pin every RNG so two runs (e.g. duration-DTW on vs off) differ ONLY by the intended change,
+    # not by random data order. Seed the global `random` BEFORE building the dataset (EMDATASET
+    # does random.shuffle(self.data) at load time). The DataLoader shuffle is pinned per-epoch below.
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+    torch.manual_seed(random_seed)
+    torch.cuda.manual_seed_all(random_seed)
+    print(f'[seed] pinned RNGs to {random_seed} (dataset data-order, dropout, DataLoader shuffle)')
+
+    # Bridge the adapter knobs to the env vars that the E-step (dataset.update_pts) and M-step
+    # (AMTAdapter.run_on_batch) read internally — so `python train.py with DURATION_DTW=1` works
+    # and the values are logged in config.json. (No effect in non-adapter mode: both are _is_adapter-gated.)
+    os.environ['USE_FOCAL']      = str(USE_FOCAL)
+    os.environ['POS_WEIGHT']     = str(POS_WEIGHT)
+    os.environ['FOCAL_ALPHA']    = str(FOCAL_ALPHA)
+    os.environ['DURATION_DTW']   = str(DURATION_DTW)
+    os.environ['DURATION_DTW_W'] = str(DURATION_DTW_W)
+    print(f'[adapter knobs] USE_FOCAL={USE_FOCAL} POS_WEIGHT={POS_WEIGHT} FOCAL_ALPHA={FOCAL_ALPHA} '
+          f'DURATION_DTW={DURATION_DTW} DURATION_DTW_W={DURATION_DTW_W}')
+
     data_name = 'mirst500_15sec_data_full_quantized'
     train_data_path = f'/data/hakka/mynoteem_new/data/{data_name}_NoteEM_audio'
     labels_path = f'/data/hakka/mynoteem_new/data/{data_name}_NoteEM_tsv'
@@ -64,6 +97,9 @@ def train(logdir, device, iterations, checkpoint_interval, batch_size, sequence_
     os.makedirs(labels_path, exist_ok=True)
 
     train_groups = sorted([g for g in os.listdir(labels_path) if os.path.isdir(os.path.join(labels_path, g))])
+    if max_groups:
+        train_groups = train_groups[:max_groups]
+        print(f'[max_groups] limiting to {len(train_groups)} groups for fast testing')
 
     if visualize:
         viz_dir = os.path.join(logdir, 'viz')
@@ -84,12 +120,26 @@ def train(logdir, device, iterations, checkpoint_interval, batch_size, sequence_
                            labels_path=labels_path,
                            groups=train_groups,
                             sequence_length=sequence_length,
-                            seed=42,
+                            seed=random_seed,
                            device=DEFAULT_DEVICE,
                             instrument_map=instrument_map,
                             conversion_map=conversion_map
                         )
     print('len dataset', len(dataset), len(dataset.data))
+
+    # Tie iterations to dataset size so subset runs keep the SAME per-epoch intensity as the
+    # full-set default (1592 iters * 8 / 12738 clips ~= 1 pass/epoch). Prevents the silent
+    # oversampling footgun (e.g. max_groups=60 + iterations=1592 => 19x passes/epoch -> onset
+    # collapse). Explicit iterations still honored, but a far-from-1x value is warned loudly.
+    if iterations is None:
+        iterations = max(1, len(dataset) // batch_size)
+        print(f'[iterations] auto={iterations} (~1 pass/epoch over {len(dataset)} clips)')
+    else:
+        _passes = iterations * batch_size / max(1, len(dataset))
+        print(f'[iterations] explicit={iterations} => {_passes:.1f} passes/epoch over {len(dataset)} clips')
+        if not (0.5 <= _passes <= 2.0):
+            print(f'[WARN] {_passes:.1f} passes/epoch is far from ~1; oversampling can collapse '
+                  f'the onset signal (see the 19x-oversampling failure). Consider iterations=None (auto).')
 
     #####
     if adapter_mode:
@@ -153,7 +203,10 @@ def train(logdir, device, iterations, checkpoint_interval, batch_size, sequence_
                                gt_json_path=gt_json_path,
                                notes_json_path=notes_json_path,
                                )
-        loader = DataLoader(dataset, batch_size, shuffle=True, drop_last=True)
+        # per-epoch generator seeded by (random_seed, epoch): the shuffle for each epoch depends
+        # only on these, so it is identical across runs regardless of other RNG consumption.
+        loader = DataLoader(dataset, batch_size, shuffle=True, drop_last=True,
+                            generator=torch.Generator().manual_seed(random_seed + epoch))
 
         total_loss = []
         transcriber.train()
@@ -180,7 +233,7 @@ def train(logdir, device, iterations, checkpoint_interval, batch_size, sequence_
             batch = next(curr_loader)
             optimizer.zero_grad()
 
-            n_weight = 1 if adapter_mode else (1 if HOP_LENGTH == 512 else 2)
+            n_weight = 20 if adapter_mode else (1 if HOP_LENGTH == 512 else 2)  # decoupled onset: ~neg:pos ratio
             transcription, transcription_losses = transcriber.run_on_batch(batch, parallel_transcriber,
                                                                            positive_weight=n_weight,
                                                                            inv_positive_weight=n_weight,

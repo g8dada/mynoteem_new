@@ -182,6 +182,14 @@ def _compute_cqt(audio_short):
     return torch.from_numpy(cqt_mag).float()  # (168, T_cqt)
 
 
+def _atomic_torch_save(obj, path):
+    """Write a .pt cache atomically so a concurrent reader never sees a half-written file.
+    Saves to a per-process temp in the same directory, then os.replace (atomic on one filesystem)."""
+    tmp = f'{path}.tmp.{os.getpid()}'
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
 def _precompute_pt(args):
     """Worker function (module-level for pickling) that computes and saves one .pt cache.
 
@@ -202,7 +210,7 @@ def _precompute_pt(args):
             midi = np.loadtxt(tsv, delimiter='\t', skiprows=1, ndmin=2)
             data['unaligned_label'] = midi_to_frames(midi, [], conversion_map=conversion_map)
             data['path'] = cache_path.replace('.pt', '.flac')
-        torch.save(data, cache_path)
+        _atomic_torch_save(data, cache_path)
     except Exception as exc:
         print(f'Warning: _precompute_pt failed for {flac}: {exc}')
 
@@ -452,18 +460,29 @@ class EMDATASET(Dataset):
             _cache_path = self.labels_path + '/' + flac.split('/')[-1].replace('.flac', '.pt')
             _cache_valid = False
             _adapter_mode = len(self.instruments) == 0
+            _cached = None
             if os.path.isfile(_cache_path):
-                _cached = torch.load(_cache_path, weights_only=False)
+                try:
+                    _cached = torch.load(_cache_path, weights_only=False)
+                except Exception:
+                    _cached = None   # concurrent remove / half-written file (parallel run): treat as cache miss
+            if _cached is not None:
                 _needs_cqt = _adapter_mode and 'cqt' not in _cached
                 if 'unaligned_label' in _cached:
                     _expected_cols = (len(self.instruments) + 1) * N_KEYS
                     if _cached['unaligned_label'].shape[-1] != _expected_cols:
                         print(f'Cache column mismatch for {flac}: '
                               f'{_cached["unaligned_label"].shape[-1]} vs {_expected_cols}, regenerating.')
-                        os.remove(_cache_path)
+                        try:
+                            os.remove(_cache_path)
+                        except FileNotFoundError:
+                            pass  # another concurrent run already removed/regenerated it
                     elif _needs_cqt:
                         print(f'Cache missing CQT for {flac}, regenerating.')
-                        os.remove(_cache_path)
+                        try:
+                            os.remove(_cache_path)
+                        except FileNotFoundError:
+                            pass  # another concurrent run already removed/regenerated it
                     else:
                         if 'path' not in _cached:
                             _cached['path'] = _cache_path.replace('.pt', '.flac')
@@ -472,7 +491,10 @@ class EMDATASET(Dataset):
                 else:
                     if _needs_cqt:
                         print(f'Cache missing CQT for {flac}, regenerating.')
-                        os.remove(_cache_path)
+                        try:
+                            os.remove(_cache_path)
+                        except FileNotFoundError:
+                            pass  # another concurrent run already removed/regenerated it
                     else:
                         self.pts[flac] = _cached
                         _cache_valid = True
@@ -494,7 +516,7 @@ class EMDATASET(Dataset):
                     if _adapter_mode:
                         data['cqt'] = _compute_cqt(audio)
                     self.pts[flac] = data
-                    torch.save(data,
+                    _atomic_torch_save(data,
                                self.labels_path + '/' + flac.split('/')[-1]
                                .replace('.flac', '.pt').replace('.mp3', '.pt'))
                     continue
@@ -504,7 +526,7 @@ class EMDATASET(Dataset):
                             audio=audio, unaligned_label=unaligned_label)
                 if _adapter_mode:
                     data['cqt'] = _compute_cqt(audio)
-                torch.save(data, self.labels_path + '/' + flac.split('/')[-1]
+                _atomic_torch_save(data, self.labels_path + '/' + flac.split('/')[-1]
                                .replace('.flac', '.pt').replace('.mp3', '.pt'))
                 self.pts[flac] = data
 
@@ -669,61 +691,85 @@ class EMDATASET(Dataset):
             onset_pred_np = onset_pred.numpy()
             frame_pred_np = frame_pred.numpy()
 
-            ####
-            pred_bag_of_notes = (onset_pred_np[:, -N_KEYS:] >= 0.5).sum(axis=0)
-            gt_bag_of_notes = unaligned_onsets[:, -N_KEYS:].astype(bool).sum(axis=0)
-            bon_dist = (((pred_bag_of_notes - gt_bag_of_notes) ** 2).sum()) ** 0.5
-            # print('pred bag of notes', pred_bag_of_notes)
-            # print('gt bag of notes', gt_bag_of_notes)
-            bon_dist /= gt_bag_of_notes.sum()
-            print('bag of notes dist', bon_dist)
-            ####
+            # (bag-of-notes distance is computed AFTER note extraction below, so the
+            #  adapter can count extracted note spikes instead of the dead >=0.5 product)
 
-            # For adapter mode: build a sparse onset piano-roll for DTW via note extraction.
-            # Raw peak-picked onset_pred has high values throughout note sustain (AST features
-            # are nearly constant during a sustained note), giving DTW hundreds of events vs
-            # ~20 GT events — too dense for meaningful alignment.
-            # Fix: extract notes (onset peak + frame sustain tracking + min-duration filter)
-            # so DTW receives one spike per note, matching the sparse GT chroma structure.
+            # For adapter mode: build the sparse onset piano-roll for DTW by NATIVE-HEAD
+            # decoding, not by thresholding the dense product pianoroll.
+            #   - onset timing from the sharp onset gate sigma(onset), recovered as
+            #       gate[t] = max_k onset_pred[t] / max_k frame_pred[t]   (== sigmoid(onset_logit),
+            #       since onset_pred = sigma(onset)*pitchP and frame_pred = pitchP share argmax),
+            #     thresholded at a MEANINGFUL level (~0.5) instead of the product at 0.05.
+            #   - pitch from argmax of the frame (pitch) posterior — one pitch per frame
+            #     (correct for monophonic singing).
+            # onset_pred_np is already peak-picked (above), so nonzero frames are product peaks;
+            # we keep only those whose recovered onset-gate confidence clears the threshold ->
+            # one clean, pitch-resolved onset per real attack (far less over-production).
             if _is_adapter:
-                _DTW_ONSET_THRESH = 0.05
-                _DTW_FRAME_THRESH = 0.5
-                _DTW_MIN_NOTE_FRAMES = 3
-                onsets_bin = (onset_pred_np > _DTW_ONSET_THRESH).astype(np.uint8)
-                frames_bin = (frame_pred_np > _DTW_FRAME_THRESH).astype(np.uint8)
+                # threshold on the recovered onset gate; 0.3 lands near GT note counts
+                # (the gate is recovered via division so it runs lower than raw sigma(onset);
+                #  a proper logit-based decode via forward_logits is the clean follow-up).
+                _NATIVE_ONSET_THRESH = 0.3
+                _eps = 1e-6
+                _onset_max = onset_pred_np[:, -N_KEYS:].max(axis=1)        # (T,) peak-picked product onset
+                _pitch_max = frame_pred_np[:, -N_KEYS:].max(axis=1)        # (T,) pitchP
+                gate = np.clip(_onset_max / (_pitch_max + _eps), 0.0, 1.0) # ~ sigmoid(onset_logit)
+                gate[_onset_max < 0.02] = 0.0                              # drop numerically-unstable frames
+                pitch_arg = frame_pred_np[:, -N_KEYS:].argmax(axis=1)      # predicted key (0..N_KEYS-1)
+                _base = onset_pred_np.shape[1] - N_KEYS                    # pitch-only block offset (0 for adapter)
                 onset_pred_for_dtw = np.zeros_like(onset_pred_np)
                 n_extracted = 0
-                for k in range(N_KEYS):
-                    t = 0
-                    while t < len(onsets_bin):
-                        if not onsets_bin[t, k]:
-                            t += 1
-                            continue
-                        f_on = t
-                        f_off = t
-                        while f_off < len(onsets_bin) and (onsets_bin[f_off, k] or frames_bin[f_off, k]):
-                            f_off += 1
-                        if f_off - f_on >= _DTW_MIN_NOTE_FRAMES:
-                            onset_pred_for_dtw[f_on, k] = onset_pred_np[f_on, k]
-                            n_extracted += 1
-                        t = f_off if f_off > t else t + 1
+                for t in range(len(gate)):
+                    if gate[t] > _NATIVE_ONSET_THRESH:
+                        onset_pred_for_dtw[t, _base + pitch_arg[t]] = gate[t]
+                        n_extracted += 1
                 onset_pred_np_for_dtw = onset_pred_for_dtw
-                print(f'adapter note-extract DTW events: {n_extracted} pred, '
+                print(f'adapter native-decode DTW events: {n_extracted} pred, '
                       f'{int(unaligned_onsets[:, -N_KEYS:].any(axis=1).sum())} gt frames')
             else:
                 onset_pred_np_for_dtw = onset_pred_np
 
-            # We align based on likelihoods regardless of the octave (chroma features)
-            onset_pred_comp = compress_across_octave(onset_pred_np_for_dtw[:, -N_KEYS:])
-            onset_label_comp = compress_across_octave(unaligned_onsets[:, -N_KEYS:])
-            # We can do DTW on super-frames since anyway we search for local max afterwards
-            onset_pred_comp = compress_time(onset_pred_comp, DTW_FACTOR)
-            onset_label_comp = compress_time(onset_label_comp, DTW_FACTOR)
+            # Bag-of-notes distance (pitch only), computed AFTER note extraction.
+            # For the adapter the product onset caps ~0.3, so the old `>= 0.5` count was
+            # always zero -> BON was a GT-only constant (a dead metric), so BEST_BON never
+            # refined labels after epoch 1 and the EM loop was frozen. Count the extracted
+            # onset spikes (one per note) instead, so BON tracks the model and the loop turns.
+            if _is_adapter:
+                pred_bag_of_notes = (onset_pred_np_for_dtw[:, -N_KEYS:] > 0).sum(axis=0)
+            else:
+                pred_bag_of_notes = (onset_pred_np[:, -N_KEYS:] >= 0.5).sum(axis=0)
+            gt_bag_of_notes = unaligned_onsets[:, -N_KEYS:].astype(bool).sum(axis=0)
+            bon_dist = (((pred_bag_of_notes - gt_bag_of_notes) ** 2).sum()) ** 0.5
+            bon_dist /= gt_bag_of_notes.sum()
+            print('bag of notes dist', bon_dist)
 
-            print('dtw lengths', len(onset_pred_comp), len(onset_label_comp))
+            # --- DTW feature (chroma: octave-independent, time-compressed to super-frames) ---
+            # Onset-only (default): align sharp onset chroma. Warps ONSET times well, but the path
+            # is unconstrained through silent gaps, so note offsets are not warped -> durations fall
+            # back to global proportional scaling (option 2 below).
+            # Duration DTW (DURATION_DTW=1): also append the frame/sustain chroma (note envelopes).
+            # A sustained note is a block whose RISING edge is the onset and FALLING edge is the
+            # offset; DTW aligns both edges, so the warp becomes duration-aware and offsets can be
+            # read straight off it (option 1 below). Onset chroma (sparse, ~1.0) still anchors the
+            # path; the sustain term (weighted _FW) fills the gaps and pins note ends.
+            _DURATION_DTW = _is_adapter and os.environ.get('DURATION_DTW', '0') == '1'
+            onset_pred_comp = compress_time(compress_across_octave(onset_pred_np_for_dtw[:, -N_KEYS:]), DTW_FACTOR)
+            onset_label_comp = compress_time(compress_across_octave(unaligned_onsets[:, -N_KEYS:]), DTW_FACTOR)
+            if _DURATION_DTW:
+                _FW = float(os.environ.get('DURATION_DTW_W', '0.5'))   # sustain weight relative to onset
+                _frame_pred_bin = (frame_pred_np[:, -N_KEYS:] > 0.1).astype(np.uint8)
+                frame_pred_comp = compress_time(compress_across_octave(_frame_pred_bin), DTW_FACTOR)
+                frame_label_comp = compress_time(compress_across_octave(unaligned_frames[:, -N_KEYS:]), DTW_FACTOR)
+                _Tp = min(len(onset_pred_comp), len(frame_pred_comp))
+                _Tl = min(len(onset_label_comp), len(frame_label_comp))
+                pred_feat = np.concatenate([onset_pred_comp[:_Tp], _FW * frame_pred_comp[:_Tp]], axis=1)
+                label_feat = np.concatenate([onset_label_comp[:_Tl], _FW * frame_label_comp[:_Tl]], axis=1)
+            else:
+                pred_feat, label_feat = onset_pred_comp, onset_label_comp
+
+            print('dtw lengths', len(pred_feat), len(label_feat), '(duration)' if _DURATION_DTW else '(onset-only)')
             init_time = time.time()
-            alignment = dtw(onset_pred_comp, onset_label_comp, dist_method='euclidean',
-                            )
+            alignment = dtw(pred_feat, label_feat, dist_method='euclidean')
             finish_time = time.time()
             print('DTW took {} seconds.'.format(finish_time - init_time))
             index1, index2 = alignment.index1, alignment.index2
@@ -758,17 +804,26 @@ class EMDATASET(Dataset):
                     t_off += 1
                 note_len = t_off - t # this is the note length in the unaligned midi. We need note length in the audio.
 
-                # option 1: use mapping, traverse note length in the unaligned midi, and then use the reverse mapping:
-                try:
-                    t_off_src1 = max(matches2[(DTW_FACTOR * max(matches1[t_src // DTW_FACTOR]) + note_len) // DTW_FACTOR]) * DTW_FACTOR
-                    t_off_src1 = max(t_src + 1, t_off_src1)
-                except Exception as e:
-                    t_off_src1 = len(aligned_offsets)
-                # option 2: use relative note length
+                # option 2: use relative note length (global proportional scaling) — robust reference
                 t_off_src2 = t_src + int(note_len * (len(aligned_onsets) / len(unaligned_onsets)))
                 t_off_src2 = min(len(aligned_onsets), t_off_src2)
 
-                t_off_src = t_off_src2 # we choose option 2
+                # option 1: warp-mapped offset (duration DTW), GUARDED.
+                # The warp can be distorted (weak onset/sustain signal). Unguarded, a failed lookup
+                # fell back to the clip end (-> spurious full-length notes) and a distorted warp
+                # inflated durations. Guards: on lookup failure OR a warp-mapped duration > 3x the
+                # global-scaled duration, fall back to option 2 so a bad warp can't produce garbage.
+                _dur2 = max(1, t_off_src2 - t_src)
+                try:
+                    t_off_src1 = max(matches2[(DTW_FACTOR * max(matches1[t_src // DTW_FACTOR]) + note_len) // DTW_FACTOR]) * DTW_FACTOR
+                    t_off_src1 = max(t_src + 1, t_off_src1)
+                    if (t_off_src1 - t_src) > 3 * _dur2:
+                        t_off_src1 = t_off_src2
+                except Exception:
+                    t_off_src1 = t_off_src2
+
+                # A (DURATION_DTW off) uses option 2, byte-identical to before.
+                t_off_src = t_off_src1 if _DURATION_DTW else t_off_src2
                 aligned_frames[t_src: t_off_src, f] = 1
 
                 if t_off_src < len(aligned_offsets):

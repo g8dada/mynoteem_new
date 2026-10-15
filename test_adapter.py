@@ -42,8 +42,10 @@ ZS_MODEL_PATH      = '/data/hakka/singing_transcription_ICASSP2021/AST/models/10
 ZS_CACHE_JSON      = '/data/hakka/mynoteem_new/test_zeroshot/mirst_zeroshot_results.json'
 GT_JSON            = '/data/hakka/singing_transcription_ICASSP2021/MIR-ST500_20210206/MIR-ST500_corrected.json'
 
-run_dir = 'transcriber-261005-014957-adapter_True'
-ADAPTER_MODEL_PATH = f'/data/hakka/mynoteem_new/runs/{run_dir}/transcriber_15.pt'   # epoch 15 checkpoint
+run_dir = os.environ.get('RUN_DIR', 'transcriber-261014-004813-adapter_True')
+ADAPTER_MODEL_PATH = os.environ.get(
+    'ADAPTER_MODEL_PATH',
+    f'/data/hakka/mynoteem_new/runs/{run_dir}/transcriber_15.pt')   # epoch 15 checkpoint
 OUT_DIR            = f'/data/hakka/mynoteem_new/runs/{run_dir}/test_results'
 
 # ─── Hyper-parameters ─────────────────────────────────────────────────────────

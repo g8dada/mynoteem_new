@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import librosa
 import torch
@@ -266,6 +267,24 @@ def _soft_dtw_loss(pred_seq, gt_seq, gamma=1.0):
     return R[T, Q] / T
 
 
+def _focal_bce(logits, targets, alpha=0.25, gamma=2.0):
+    """Sigmoid focal loss (RetinaNet), normalized by the number of positives.
+
+    Down-weights easy examples via (1-p_t)^gamma and tilts toward negatives via alpha<0.5,
+    so the loss is dominated by HARD negatives — the sustain frames the onset head wrongly
+    fires on. That sharpens the onset (attack-only) instead of the dense voiced-detector
+    behaviour that over-produces notes. Normalizing by #positives keeps the scale ~O(1),
+    comparable to the pitch CE terms.
+    """
+    ce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+    p = torch.sigmoid(logits)
+    p_t = p * targets + (1 - p) * (1 - targets)
+    loss = ce * (1 - p_t) ** gamma
+    alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+    loss = alpha_t * loss
+    return loss.sum() / targets.sum().clamp(min=1.0)
+
+
 class AMTAdapter(nn.Module):
     """Wraps EffNetb0 to provide an OnsetsAndFrames-compatible interface for the EM loop.
 
@@ -456,13 +475,100 @@ class AMTAdapter(nn.Module):
 
         return onset_pred, offset_pred, frame_pred, frame_pred, velocity_pred
 
-    def run_on_batch(self, batch, parallel_model=None, multi=False,
-                     positive_weight=2., inv_positive_weight=2.):
-        """M-step: compute predictions and weighted BCE losses against pseudo-labels.
+    def forward_logits(self, audio, cqt=None):
+        """Per-frame RAW logits at T_mel, for the decoupled training loss.
 
-        Calls backward() per clip so only one clip's gradient graph lives in VRAM
-        at a time (~2.5 GB peak vs ~20 GB for a naive batch of 8).
-        Returns detached scalar losses — caller must NOT call loss.backward() again.
+        Mirrors forward()'s window/backbone pass but keeps the native AST logits
+        (interpolated to the mel grid) instead of forming the pitch product.
+        Returns:
+            onset_logit  : (B, T_mel)
+            offset_logit : (B, T_mel)
+            oct_logits   : (B, T_mel, pitch_octave+1 = 5)
+            cls_logits   : (B, T_mel, pitch_class+1 = 13)
+        """
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)
+        B, L = audio.shape
+        T_mel = (L - 1) // HOP_LENGTH + 1
+
+        if isinstance(cqt, (list, tuple)):
+            cqt_per_clip = cqt
+        elif cqt is not None:
+            cqt_per_clip = [cqt[b] for b in range(B)]
+        else:
+            cqt_per_clip = [None] * B
+
+        all_windows, clip_t_cqts = [], []
+        for b in range(B):
+            w = self._audio_to_windows(audio[b], cqt=cqt_per_clip[b])
+            all_windows.append(w)
+            clip_t_cqts.append(w.shape[0])
+        stacked = torch.cat(all_windows, dim=0)
+
+        _chunk = 128
+        o_c, of_c, oct_c, cls_c = [], [], [], []
+        for _i in range(0, stacked.shape[0], _chunk):
+            _o, _of, _oct, _cls = self.backbone(stacked[_i:_i + _chunk])
+            o_c.append(_o); of_c.append(_of); oct_c.append(_oct); cls_c.append(_cls)
+        o_all = torch.cat(o_c); of_all = torch.cat(of_c)
+        oct_all = torch.cat(oct_c); cls_all = torch.cat(cls_c)
+
+        def _interp1d(x):                       # x: (t,) or (t, C)
+            if x.dim() == 1:
+                return F.interpolate(x.view(1, 1, -1), size=T_mel,
+                                     mode='linear', align_corners=False).view(-1)
+            return F.interpolate(x.T.unsqueeze(0), size=T_mel,
+                                 mode='linear', align_corners=False).squeeze(0).T
+
+        ol, ofl, octl, clsl = [], [], [], []
+        start = 0
+        for t_cqt in clip_t_cqts:
+            end = start + t_cqt
+            ol.append(_interp1d(o_all[start:end]))       # (T_mel,)
+            ofl.append(_interp1d(of_all[start:end]))     # (T_mel,)
+            octl.append(_interp1d(oct_all[start:end]))   # (T_mel, 5)
+            clsl.append(_interp1d(cls_all[start:end]))   # (T_mel, 13)
+            start = end
+        return torch.stack(ol), torch.stack(ofl), torch.stack(octl), torch.stack(clsl)
+
+    @staticmethod
+    def _derive_decoupled_targets(onset_label, offset_label, frame_label):
+        """Binary pianoroll labels (B,T,N_KEYS) -> per-frame AST-native targets.
+
+        onset_t, offset_t : (B,T) float {0,1}  — any-pitch onset / offset at this frame
+        oct_tgt, cls_tgt  : (B,T) long          — active pitch's octave/class;
+                            silent frame -> "no-pitch" class (4 / 12);
+                            sounding but outside AST MIDI 36-83 -> -100 (ignored in CE).
+        Assumes monophonic (singing): one active pitch per frame.
+        """
+        onset_t  = (onset_label.amax(-1) > 0).float()
+        offset_t = (offset_label.amax(-1) > 0).float()
+        present  = frame_label.amax(-1) > 0
+        active_k = frame_label.argmax(-1)                # 0-based key index
+        midi     = active_k + MIN_MIDI
+        in_range = present & (midi >= AMTAdapter._MIDI_LOW) & (midi <= AMTAdapter._MIDI_HIGH)
+
+        oct_tgt = torch.full_like(active_k, 4)           # idx 4 = no-pitch octave
+        cls_tgt = torch.full_like(active_k, 12)          # idx 12 = no-pitch class
+        oct_tgt[in_range] = (midi[in_range] - AMTAdapter._MIDI_LOW) // 12   # -> {0..3}
+        cls_tgt[in_range] =  midi[in_range] % 12                            # -> {0..11}
+        oor = present & (~in_range)
+        oct_tgt[oor] = -100
+        cls_tgt[oor] = -100
+        return onset_t, offset_t, oct_tgt.long(), cls_tgt.long()
+
+    def run_on_batch(self, batch, parallel_model=None, multi=False,
+                     positive_weight=20., inv_positive_weight=20.):
+        """M-step (DECOUPLED loss): per-frame onset/offset BCE-with-logits + octave/class CE.
+
+        Replaces the old product-pianoroll BCE (onset = sigmoid(onset)*P(oct)*P(cls),
+        capped ~0.2, trained against target 1 -> collapsed to zero). Here the onset/offset
+        heads are trained on their raw logits (reachable [0,1]) and pitch via softmax CE —
+        the AST model's native objective, fed by EM pseudo-labels.
+
+        Calls backward() per clip (VRAM); returns detached scalar losses (do NOT backward again).
+        predictions still contains the product pianoroll so the E-step / train.py metrics are
+        unchanged.
         """
         audio_label = batch['audio']
         onset_label = batch['onset']
@@ -471,62 +577,64 @@ class AMTAdapter(nn.Module):
         cqt_batch = batch.get('cqt')   # (B, 168, T_cqt_seq) or None
         B = audio_label.shape[0]
 
-        # Precompute loss masks (no model involvement)
-        onset_mask = 1. * onset_label
-        onset_mask[..., :-N_KEYS] *= (positive_weight - 1)
-        onset_mask[..., -N_KEYS:] *= (inv_positive_weight - 1)
-        onset_mask += 1
-        if 'onset_mask' in batch:
-            onset_mask = onset_mask * batch['onset_mask']
-        offset_mask = 1. * offset_label * (2. - 1) + 1.
-        frame_mask = 1. * frame_label * (2. - 1) + 1.
-
-        # SoftDTW settings — set _SDTW_GAMMA to 0.1, 1.0, or 10.0 for experiments
-        _SDTW_GAMMA  = 10.0   # 0.1=near-hard DTW, 1.0=standard, 10.0=very smooth
-        _SDTW_WEIGHT = 0   # scale relative to BCE losses (~0.3-0.7)
-        # unaligned_onset_batch = batch.get('unaligned_onset')  # (B, T, N_KEYS) or None
-        unaligned_onset_batch = None  # softDTW disabled
+        # Focal loss on onset/offset (replaces flat pos_weight BCE, which maximised recall
+        # at the cost of dense over-production). alpha<0.5 + gamma=2 focus on hard sustain
+        # false-positives -> sharper onsets -> note count closer to GT. positive_weight is
+        # now unused for the adapter (kept in the signature for API compatibility).
+        # Onset/offset loss selector:
+        #   USE_FOCAL=1 -> focal (sharper onsets, but LOW amplitude -> fades under a fixed decode
+        #                  threshold at full training scale).
+        #   USE_FOCAL=0 -> positive-weighted BCE (HIGH, fade-resistant amplitude; some over-production).
+        USE_FOCAL   = os.environ.get('USE_FOCAL', '0') == '1'
+        FOCAL_ALPHA = float(os.environ.get('FOCAL_ALPHA', '0.4'))
+        FOCAL_GAMMA = float(os.environ.get('FOCAL_GAMMA', '2.0'))
+        POS_WEIGHT  = float(os.environ.get('POS_WEIGHT', str(positive_weight)))
+        _pos_w = torch.tensor(POS_WEIGHT, device=audio_label.device)
+        W_ONSET, W_OFFSET, W_OCT, W_CLS = 1.0, 1.0, 1.0, 1.0   # tunable loss weights
 
         total_onset = 0.
         total_offset = 0.
-        total_frame = 0.
-        total_sdtw = 0.
+        total_pitch = 0.
         onset_preds, frame_preds, offset_preds = [], [], []
 
         for b in range(B):
             cqt_b = cqt_batch[b:b + 1] if cqt_batch is not None else None
-            o, of, _, f, _ = self.forward(audio_label[b:b + 1], cqt_b)
+            ol, ofl, octl, clsl = self.forward_logits(audio_label[b:b + 1], cqt_b)
+            # ol,ofl: (1,T)   octl: (1,T,5)   clsl: (1,T,13)
 
-            o_loss = (onset_mask[b:b + 1] * F.binary_cross_entropy(
-                o, onset_label[b:b + 1], reduction='none')).mean()
-            of_loss = (offset_mask[b:b + 1] * F.binary_cross_entropy(
-                of, offset_label[b:b + 1], reduction='none')).mean()
-            f_loss = (frame_mask[b:b + 1] * F.binary_cross_entropy(
-                f, frame_label[b:b + 1], reduction='none')).mean()
+            onset_t, offset_t, oct_tgt, cls_tgt = self._derive_decoupled_targets(
+                onset_label[b:b + 1], offset_label[b:b + 1], frame_label[b:b + 1])
 
-            # SoftDTW loss: align pred chroma against unaligned MIDI in a differentiable way.
-            # Dense onset_pred → high DTW distance → gradient to be more selective.
-            sdtw_loss = torch.tensor(0.0, device=audio_label.device)
-            if unaligned_onset_batch is not None:
-                gt_chroma = _compress_time_torch(
-                    _compress_across_octave_torch(unaligned_onset_batch[b]), DTW_FACTOR)     # (T_c, 12)
-                if gt_chroma.any():  # skip clips with no unaligned label (all-zero fallback)
-                    pred_chroma = _compress_time_torch(
-                        _compress_across_octave_torch(o.squeeze(0)[..., -N_KEYS:]), DTW_FACTOR)  # (T_c, 12)
-                    sdtw_loss = _soft_dtw_loss(pred_chroma, gt_chroma, gamma=_SDTW_GAMMA) * _SDTW_WEIGHT
+            if USE_FOCAL:
+                l_onset  = _focal_bce(ol,  onset_t,  FOCAL_ALPHA, FOCAL_GAMMA)
+                l_offset = _focal_bce(ofl, offset_t, FOCAL_ALPHA, FOCAL_GAMMA)
+            else:
+                l_onset  = F.binary_cross_entropy_with_logits(ol,  onset_t,  pos_weight=_pos_w)
+                l_offset = F.binary_cross_entropy_with_logits(ofl, offset_t, pos_weight=_pos_w)
+            # CE guarded against the (rare) all-ignored case
+            if (oct_tgt != -100).any():
+                l_oct = F.cross_entropy(octl.reshape(-1, octl.shape[-1]), oct_tgt.reshape(-1), ignore_index=-100)
+            else:
+                l_oct = torch.zeros((), device=audio_label.device)
+            if (cls_tgt != -100).any():
+                l_cls = F.cross_entropy(clsl.reshape(-1, clsl.shape[-1]), cls_tgt.reshape(-1), ignore_index=-100)
+            else:
+                l_cls = torch.zeros((), device=audio_label.device)
 
-            # Divide by B so gradient magnitude matches a full-batch average
-            clip_loss = (o_loss + of_loss + f_loss + sdtw_loss) / B
+            clip_loss = (W_ONSET * l_onset + W_OFFSET * l_offset
+                         + W_OCT * l_oct + W_CLS * l_cls) / B
             clip_loss.backward()
 
-            total_onset += o_loss.item()
-            total_offset += of_loss.item()
-            total_frame += f_loss.item()
-            total_sdtw += sdtw_loss.item()
+            total_onset  += l_onset.item()
+            total_offset += l_offset.item()
+            total_pitch  += (l_oct.item() + l_cls.item())
 
-            onset_preds.append(o.detach())
-            frame_preds.append(f.detach())
-            offset_preds.append(of.detach())
+            # product pianoroll preds (for train.py metrics + E-step parity), from the same logits
+            onset_pp, frame_pp, offset_pp = self._per_pitch_probs(
+                ol[0].detach(), ofl[0].detach(), octl[0].detach(), clsl[0].detach())
+            onset_preds.append(onset_pp.unsqueeze(0))
+            frame_preds.append(frame_pp.unsqueeze(0))
+            offset_preds.append(offset_pp.unsqueeze(0))
 
         predictions = {
             'onset': torch.cat(onset_preds, dim=0).reshape(*onset_label.shape),
@@ -540,7 +648,6 @@ class AMTAdapter(nn.Module):
         losses = {
             'loss/onset':  torch.tensor(total_onset  / B),
             'loss/offset': torch.tensor(total_offset / B),
-            'loss/frame':  torch.tensor(total_frame  / B),
-            'loss/sdtw':   torch.tensor(total_sdtw   / B),
+            'loss/pitch':  torch.tensor(total_pitch  / B),
         }
         return predictions, losses
