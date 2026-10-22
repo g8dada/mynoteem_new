@@ -40,12 +40,13 @@ from onsets_and_frames.utils import get_peaks
 AUDIO_DIR        = '/data/hakka/mynoteem_new/data/mirst500_15sec_data_full_quantized_NoteEM_audio'
 ZS_CACHE_JSON    = '/data/hakka/mynoteem_new/test_zeroshot/mirst_zeroshot_results.json'
 GT_JSON          = '/data/hakka/singing_transcription_ICASSP2021/MIR-ST500_20210206/MIR-ST500_corrected.json'
+EPOCH = 1
 
-run_dir = os.environ.get('RUN_DIR', 'transcriber-261012-174522-adapter_False')
+run_dir = os.environ.get('RUN_DIR', 'transcriber-261013-161009-adapter_False')
 NOTEM_MODEL_PATH = os.environ.get(
     'NOTEM_MODEL_PATH',
-    f'/data/hakka/mynoteem_new/runs/{run_dir}/transcriber_15.pt')   # epoch 15 checkpoint
-OUT_DIR          = f'/data/hakka/mynoteem_new/runs/{run_dir}/test_results'
+    f'/data/hakka/mynoteem_new/runs/{run_dir}/transcriber_{EPOCH}.pt')   # epoch 15 checkpoint
+OUT_DIR          = f'/data/hakka/mynoteem_new/runs/{run_dir}/test_results_epoch_{EPOCH}'
 
 # ─── Hyper-parameters ─────────────────────────────────────────────────────────
 SEGMENT_HOP     = 15.0   # seconds (must match preprocess_mirst500.py)
@@ -301,7 +302,7 @@ def plot_comparison(summary_notem, summary_zs, n_songs, out_path):
 
     fig, ax = plt.subplots(figsize=(13, 5))
     fig.suptitle(
-        f'NoteEM (epoch 15) vs Zero-Shot EffNetb0 — MIR-ST500 ({n_songs} songs)',
+        f'NoteEM (epoch {EPOCH}) vs Zero-Shot EffNetb0 — MIR-ST500 ({n_songs} songs)',
         fontweight='bold', fontsize=13,
     )
 

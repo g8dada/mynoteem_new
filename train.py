@@ -6,7 +6,6 @@ from sacred import Experiment
 from sacred.commands import print_config
 from sacred.observers import FileStorageObserver
 from torch.nn.utils import clip_grad_norm_
-# from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from onsets_and_frames import *
@@ -28,8 +27,6 @@ def config():
     adapter_mode = False  # Set True to use EffNetb0 (AST) as the EM backbone instead of OnsetsAndFrames
     logdir = 'runs/transcriber-' + datetime.now().strftime('%y%m%d-%H%M%S') + f'-adapter_{adapter_mode}' # ckpts and midi will be saved here
     transcriber_ckpt = '/data/hakka/singing_transcription_ICASSP2021/AST/models/1005_e_4' if adapter_mode else 'ckpts/model_64.pt'
-    # When adapter_mode=True, override transcriber_ckpt with the AST checkpoint, e.g.:
-    #   transcriber_ckpt = '/data/hakka/singing_transcription_ICASSP2021/AST/models/1005_e_4'
     multi_ckpt = False # Flag if the ckpt was trained on pitch only or instrument-sensitive. The provided checkpoints were trained on pitch only.
     visualize = True  # save piano-roll PNGs and notes_log.json each epoch
     gt_json_path = '/data/hakka/singing_transcription_ICASSP2021/MIR-ST500_20210206/MIR-ST500_corrected.json'
@@ -39,14 +36,12 @@ def config():
     # Adapter EM-loop knobs. Exported to env vars in train() so the E-step (dataset) and M-step
     # (transcriber) pick them up; defaults fall back to the env var for backward compat; and being
     # config params they are logged to config.json and settable via `with DURATION_DTW=1`.
+    ONSET_ONLY     = int(os.environ.get('ONSET_ONLY', 0))         # 1 = train only onset head (zero offset/pitch losses) — diagnostic
     USE_FOCAL      = int(os.environ.get('USE_FOCAL', 0))           # 1 = focal onset/offset loss; 0 = pos-weighted BCE (adapter only)
     POS_WEIGHT     = float(os.environ.get('POS_WEIGHT', 20))       # BCE positive weight for onset/offset when USE_FOCAL=0 (adapter only)
     FOCAL_ALPHA    = float(os.environ.get('FOCAL_ALPHA', 0.4))     # onset/offset focal-loss alpha when USE_FOCAL=1 (adapter only)
     DURATION_DTW   = int(os.environ.get('DURATION_DTW', 0))        # 1 = duration-aware DTW offsets (adapter only)
     DURATION_DTW_W = float(os.environ.get('DURATION_DTW_W', 0.5))  # sustain weight in the DTW feature (adapter only)
-
-    # transcriber_ckpt = 'ckpts/'
-    # multi_ckpt = True
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     checkpoint_interval = 1 # how often to save checkpoint
@@ -65,7 +60,7 @@ def config():
 @ex.automain
 def train(logdir, device, iterations, checkpoint_interval, batch_size, sequence_length, learning_rate, learning_rate_decay_steps,
           clip_gradient_norm, epochs, transcriber_ckpt, multi_ckpt, adapter_mode, visualize, gt_json_path, max_groups,
-          random_seed, USE_FOCAL, POS_WEIGHT, FOCAL_ALPHA, DURATION_DTW, DURATION_DTW_W):
+          random_seed, ONSET_ONLY, USE_FOCAL, POS_WEIGHT, FOCAL_ALPHA, DURATION_DTW, DURATION_DTW_W):
 
     print_config(ex.current_run)
     os.makedirs(logdir, exist_ok=True)
@@ -82,15 +77,17 @@ def train(logdir, device, iterations, checkpoint_interval, batch_size, sequence_
     # Bridge the adapter knobs to the env vars that the E-step (dataset.update_pts) and M-step
     # (AMTAdapter.run_on_batch) read internally — so `python train.py with DURATION_DTW=1` works
     # and the values are logged in config.json. (No effect in non-adapter mode: both are _is_adapter-gated.)
+    os.environ['ONSET_ONLY']     = str(ONSET_ONLY)
     os.environ['USE_FOCAL']      = str(USE_FOCAL)
     os.environ['POS_WEIGHT']     = str(POS_WEIGHT)
     os.environ['FOCAL_ALPHA']    = str(FOCAL_ALPHA)
     os.environ['DURATION_DTW']   = str(DURATION_DTW)
     os.environ['DURATION_DTW_W'] = str(DURATION_DTW_W)
-    print(f'[adapter knobs] USE_FOCAL={USE_FOCAL} POS_WEIGHT={POS_WEIGHT} FOCAL_ALPHA={FOCAL_ALPHA} '
-          f'DURATION_DTW={DURATION_DTW} DURATION_DTW_W={DURATION_DTW_W}')
+    print(f'[adapter knobs] ONSET_ONLY={ONSET_ONLY} USE_FOCAL={USE_FOCAL} POS_WEIGHT={POS_WEIGHT} '
+          f'FOCAL_ALPHA={FOCAL_ALPHA} DURATION_DTW={DURATION_DTW} DURATION_DTW_W={DURATION_DTW_W}')
 
-    data_name = 'mirst500_15sec_data_full_quantized'
+    # data_name = 'mirst500_15sec_data_full_quantized'
+    data_name = 'mirst500_15sec_data_full_zeroshot'
     train_data_path = f'/data/hakka/mynoteem_new/data/{data_name}_NoteEM_audio'
     labels_path = f'/data/hakka/mynoteem_new/data/{data_name}_NoteEM_tsv'
 
@@ -135,10 +132,10 @@ def train(logdir, device, iterations, checkpoint_interval, batch_size, sequence_
         iterations = max(1, len(dataset) // batch_size)
         print(f'[iterations] auto={iterations} (~1 pass/epoch over {len(dataset)} clips)')
     else:
-        _passes = iterations * batch_size / max(1, len(dataset))
-        print(f'[iterations] explicit={iterations} => {_passes:.1f} passes/epoch over {len(dataset)} clips')
-        if not (0.5 <= _passes <= 2.0):
-            print(f'[WARN] {_passes:.1f} passes/epoch is far from ~1; oversampling can collapse '
+        passes_per_epoch = iterations * batch_size / max(1, len(dataset))
+        print(f'[iterations] explicit={iterations} => {passes_per_epoch:.1f} passes/epoch over {len(dataset)} clips')
+        if not (0.5 <= passes_per_epoch <= 2.0):
+            print(f'[WARN] {passes_per_epoch:.1f} passes/epoch is far from ~1; oversampling can collapse '
                   f'the onset signal (see the 19x-oversampling failure). Consider iterations=None (auto).')
 
     #####
@@ -179,7 +176,6 @@ def train(logdir, device, iterations, checkpoint_interval, batch_size, sequence_
     optimizer = torch.optim.Adam(list(transcriber.parameters()), lr=learning_rate, weight_decay=1e-5)
     transcriber.zero_grad()
     optimizer.zero_grad()
-    # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
     for epoch in range(1, epochs + 1):
         print('epoch', epoch)
         if epoch > 1:
@@ -217,9 +213,9 @@ def train(logdir, device, iterations, checkpoint_interval, batch_size, sequence_
             #   - normalization matches the E-step (which also runs in eval), so we
             #     optimize exactly the model that generated the labels.
             # Weights and affine gamma/beta still train; dropout stays active.
-            for _m in transcriber.backbone.modules():
-                if isinstance(_m, torch.nn.modules.batchnorm._BatchNorm):
-                    _m.eval()
+            for module in transcriber.backbone.modules():
+                if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+                    module.eval()
 
         onset_total_tp = 0.
         onset_total_pp = 0.
@@ -229,8 +225,7 @@ def train(logdir, device, iterations, checkpoint_interval, batch_size, sequence_
 
         loader_cycle = cycle(loader)
         for _ in tqdm(range(iterations)):
-            curr_loader = loader_cycle
-            batch = next(curr_loader)
+            batch = next(loader_cycle)
             optimizer.zero_grad()
 
             n_weight = 20 if adapter_mode else (1 if HOP_LENGTH == 512 else 2)  # decoupled onset: ~neg:pos ratio

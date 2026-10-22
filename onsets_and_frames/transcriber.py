@@ -211,62 +211,6 @@ def load_weights(model, old_model, n_instruments):
             model.velocity_stack[i].load_state_dict(layer_new.state_dict())
 
 
-# ---------------------------------------------------------------------------
-# SoftDTW helpers (used by AMTAdapter.run_on_batch for the M-step loss)
-# ---------------------------------------------------------------------------
-
-def _compress_across_octave_torch(x):
-    """(T, N_KEYS=88) → (T, 12) via max across 7 octaves. Matches utils.compress_across_octave.
-    Last 4 semitones (MIDI 84-87) are ignored — same as the numpy reference."""
-    T = x.shape[0]
-    n_oct = N_KEYS // 12   # 7 full octaves = 84 keys
-    return x[:, :n_oct * 12].reshape(T, n_oct, 12).max(dim=1).values
-
-
-def _compress_time_torch(x, factor):
-    """(T, 12) → (T//factor, 12) via max in each block. Differentiable."""
-    T = x.shape[0]
-    T_c = T // factor
-    return x[:T_c * factor].reshape(T_c, factor, 12).max(dim=1).values
-
-
-def _soft_dtw_loss(pred_seq, gt_seq, gamma=1.0):
-    """Differentiable softDTW distance, normalized by pred sequence length.
-
-    pred_seq : (T, D)  — requires grad
-    gt_seq   : (Q, D)  — detached label
-    gamma    : smoothness; 0.1 ≈ hard DTW, 10.0 = very smooth
-    Returns softDTW(pred, gt) / T (scalar).
-
-    Uses anti-diagonal parallelism: O(T+Q) outer iterations instead of O(T*Q).
-    """
-    T, Q = pred_seq.shape[0], gt_seq.shape[0]
-    device = pred_seq.device
-
-    cost = torch.cdist(pred_seq.float().unsqueeze(0),
-                       gt_seq.float().detach().unsqueeze(0)).squeeze(0)  # (T, Q)
-
-    INF = float('inf')
-    R = torch.full((T + 1, Q + 1), INF, dtype=torch.float32, device=device)
-    R[0, 0] = 0.0
-
-    for s in range(T + Q - 1):
-        i_lo = max(1, s + 2 - Q)
-        i_hi = min(T, s + 1)
-        ii = torch.arange(i_lo, i_hi + 1, device=device)  # 1-indexed
-        jj = s + 2 - ii                                    # 1-indexed
-
-        r_diag = R[ii - 1, jj - 1]
-        r_up   = R[ii - 1, jj    ]
-        r_left = R[ii,     jj - 1]
-
-        stacked = torch.stack([-r_diag / gamma, -r_up / gamma, -r_left / gamma], dim=1)
-        soft_min = -gamma * torch.logsumexp(stacked, dim=1)
-        R[ii, jj] = cost[ii - 1, jj - 1] + soft_min
-
-    return R[T, Q] / T
-
-
 def _focal_bce(logits, targets, alpha=0.25, gamma=2.0):
     """Sigmoid focal loss (RetinaNet), normalized by the number of positives.
 
@@ -561,14 +505,12 @@ class AMTAdapter(nn.Module):
                      positive_weight=20., inv_positive_weight=20.):
         """M-step (DECOUPLED loss): per-frame onset/offset BCE-with-logits + octave/class CE.
 
-        Replaces the old product-pianoroll BCE (onset = sigmoid(onset)*P(oct)*P(cls),
-        capped ~0.2, trained against target 1 -> collapsed to zero). Here the onset/offset
-        heads are trained on their raw logits (reachable [0,1]) and pitch via softmax CE —
-        the AST model's native objective, fed by EM pseudo-labels.
+        The onset/offset heads train on raw logits (reachable [0,1]) and pitch via softmax CE —
+        the AST model's native objective, fed by EM pseudo-labels. (The earlier product-pianoroll
+        BCE trained sigmoid(onset)*P(oct)*P(cls), capped ~0.2, against target 1 -> onset collapse.)
 
         Calls backward() per clip (VRAM); returns detached scalar losses (do NOT backward again).
-        predictions still contains the product pianoroll so the E-step / train.py metrics are
-        unchanged.
+        predictions still holds the product pianoroll so the E-step / train.py metrics are unchanged.
         """
         audio_label = batch['audio']
         onset_label = batch['onset']
@@ -577,20 +519,20 @@ class AMTAdapter(nn.Module):
         cqt_batch = batch.get('cqt')   # (B, 168, T_cqt_seq) or None
         B = audio_label.shape[0]
 
-        # Focal loss on onset/offset (replaces flat pos_weight BCE, which maximised recall
-        # at the cost of dense over-production). alpha<0.5 + gamma=2 focus on hard sustain
-        # false-positives -> sharper onsets -> note count closer to GT. positive_weight is
-        # now unused for the adapter (kept in the signature for API compatibility).
-        # Onset/offset loss selector:
-        #   USE_FOCAL=1 -> focal (sharper onsets, but LOW amplitude -> fades under a fixed decode
-        #                  threshold at full training scale).
-        #   USE_FOCAL=0 -> positive-weighted BCE (HIGH, fade-resistant amplitude; some over-production).
+        # Onset/offset loss selector (positive_weight kept only for signature compatibility):
+        #   USE_FOCAL=1 -> focal: sharper onsets but LOW amplitude (fades under a fixed decode threshold).
+        #   USE_FOCAL=0 -> positive-weighted BCE: HIGH, fade-resistant amplitude but some over-production.
         USE_FOCAL   = os.environ.get('USE_FOCAL', '0') == '1'
         FOCAL_ALPHA = float(os.environ.get('FOCAL_ALPHA', '0.4'))
         FOCAL_GAMMA = float(os.environ.get('FOCAL_GAMMA', '2.0'))
         POS_WEIGHT  = float(os.environ.get('POS_WEIGHT', str(positive_weight)))
-        _pos_w = torch.tensor(POS_WEIGHT, device=audio_label.device)
+        pos_w = torch.tensor(POS_WEIGHT, device=audio_label.device)
+        # ONSET_ONLY: train only the onset head (zero offset/octave/class losses) — diagnostic to test
+        # whether the pitch/offset gradients through the SHARED backbone+classifier smear the onset.
+        ONSET_ONLY = os.environ.get('ONSET_ONLY', '0') == '1'
         W_ONSET, W_OFFSET, W_OCT, W_CLS = 1.0, 1.0, 1.0, 1.0   # tunable loss weights
+        if ONSET_ONLY:
+            W_OFFSET = W_OCT = W_CLS = 0.0
 
         total_onset = 0.
         total_offset = 0.
@@ -609,8 +551,8 @@ class AMTAdapter(nn.Module):
                 l_onset  = _focal_bce(ol,  onset_t,  FOCAL_ALPHA, FOCAL_GAMMA)
                 l_offset = _focal_bce(ofl, offset_t, FOCAL_ALPHA, FOCAL_GAMMA)
             else:
-                l_onset  = F.binary_cross_entropy_with_logits(ol,  onset_t,  pos_weight=_pos_w)
-                l_offset = F.binary_cross_entropy_with_logits(ofl, offset_t, pos_weight=_pos_w)
+                l_onset  = F.binary_cross_entropy_with_logits(ol,  onset_t,  pos_weight=pos_w)
+                l_offset = F.binary_cross_entropy_with_logits(ofl, offset_t, pos_weight=pos_w)
             # CE guarded against the (rare) all-ignored case
             if (oct_tgt != -100).any():
                 l_oct = F.cross_entropy(octl.reshape(-1, octl.shape[-1]), oct_tgt.reshape(-1), ignore_index=-100)

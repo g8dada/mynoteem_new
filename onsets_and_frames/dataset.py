@@ -96,62 +96,50 @@ def _visualize_notes(viz_dir, seg_key, history):
 def _visualize_diag(viz_dir, seg_key, onset_pred_pitch, aligned_onsets_pitch,
                     viz_tag, bon_dist=None,
                     pred_raw=None, pred_smooth=None,
-                    label_raw=None, label_smooth=None):
+                    label_raw=None, label_smooth=None,
+                    gate=None, prod=None, offset=None, aligned_onset_t=None,
+                    onset_thr=0.3, prod_thr=0.05, offset_thr=0.5):
     """
     Diagnostic figure saved as {seg_key}_diag_{viz_tag}.png.
-    Non-adapter: 3 panels (pred chroma, GT chroma, heatmap).
-    Adapter:     5 panels (pred raw, pred smoothed, GT raw, GT smoothed, heatmap).
+    Top: chroma panels (pred / GT) + onset-probability heatmap with aligned onsets.
+    When gate/prod/offset arrays are supplied (adapter), also adds:
+      - onset-probability histogram: sigma(onset) gate (thr onset_thr) + product onset (thr prod_thr), log-y
+      - offset-probability histogram: sigma(offset) (thr offset_thr), log-y
+      - sigma(onset) time-series with the threshold line + aligned-onset ticks (sharpness/timing)
     """
     os.makedirs(viz_dir, exist_ok=True)
     is_adapter_viz = pred_smooth is not None
+    has_probs = gate is not None
     bon_str = f'  |  BON dist: {bon_dist:.4f}' if bon_dist is not None else ''
 
     if is_adapter_viz:
-        fig, axes = plt.subplots(5, 1, figsize=(14, 13),
-                                 gridspec_kw={'height_ratios': [1, 1, 1, 1, 2]})
-        fig.suptitle(f'{seg_key} — {viz_tag}{bon_str}', fontsize=10, fontweight='bold')
-
-        vmax_pred  = max(pred_raw.max(),  1e-6)
-        vmax_label = max(label_raw.max(), 1e-6)
-
-        chroma_panels = [
-            (axes[0], pred_raw,    'Pred  — raw (peak-picked)',              vmax_pred),
-            (axes[1], pred_smooth, 'Pred  — keep peak + tails (DTW input)',   vmax_pred),
-            (axes[2], label_raw,   'GT    — raw (unaligned MIDI)',            vmax_label),
-            (axes[3], label_smooth,'GT    — keep peak + tails (DTW input)',    vmax_label),
-        ]
-        for ax, data, title, vmax in chroma_panels:
-            im = ax.imshow(data.T, aspect='auto', origin='lower',
-                           cmap='hot', vmin=0, vmax=vmax, interpolation='nearest')
-            ax.set_title(title, fontsize=8)
-            ax.set_ylabel('chroma bin', fontsize=7)
-            ax.tick_params(labelsize=6)
-            plt.colorbar(im, ax=ax, fraction=0.02, pad=0.02)
-        heatmap_ax = axes[4]
+        chroma = [(pred_raw,    'Pred — raw (peak-picked)'),
+                  (pred_smooth, 'Pred — keep peak + tails (DTW input)'),
+                  (label_raw,   'GT — raw (unaligned MIDI)'),
+                  (label_smooth,'GT — keep peak + tails (DTW input)')]
     else:
-        fig, axes = plt.subplots(3, 1, figsize=(14, 9),
-                                 gridspec_kw={'height_ratios': [1, 1, 2]})
-        fig.suptitle(f'{seg_key} — {viz_tag}{bon_str}', fontsize=10, fontweight='bold')
+        chroma = [(pred_raw,  'Model onset — chroma × compressed time (peak-picked)'),
+                  (label_raw, f'Unaligned MIDI — chroma × compressed time (DTW_FACTOR={DTW_FACTOR})')]
 
-        im0 = axes[0].imshow(pred_raw.T, aspect='auto', origin='lower',
-                             cmap='hot', vmin=0, vmax=max(pred_raw.max(), 1e-6),
-                             interpolation='nearest')
-        axes[0].set_title('Model onset — chroma × compressed time (peak-picked)', fontsize=8)
-        axes[0].set_ylabel('chroma bin', fontsize=7)
-        axes[0].tick_params(labelsize=6)
-        plt.colorbar(im0, ax=axes[0], fraction=0.02, pad=0.02)
+    heights = [1] * len(chroma) + [2]          # chroma rows + heatmap
+    if has_probs:
+        heights += [1.2, 1.2]                  # histogram row + time-series row
+    fig = plt.figure(figsize=(14, max(9, sum(heights) * 1.4)))
+    gs = fig.add_gridspec(len(heights), 2, height_ratios=heights)
+    fig.suptitle(f'{seg_key} — {viz_tag}{bon_str}', fontsize=10, fontweight='bold')
 
-        im1 = axes[1].imshow(label_raw.T, aspect='auto', origin='lower',
-                             cmap='hot', vmin=0, vmax=max(label_raw.max(), 1e-6),
-                             interpolation='nearest')
-        axes[1].set_title(f'Unaligned MIDI — chroma × compressed time (DTW_FACTOR={DTW_FACTOR})', fontsize=8)
-        axes[1].set_ylabel('chroma bin', fontsize=7)
-        axes[1].tick_params(labelsize=6)
-        plt.colorbar(im1, ax=axes[1], fraction=0.02, pad=0.02)
-        heatmap_ax = axes[2]
+    r = 0
+    for data, title in chroma:
+        ax = fig.add_subplot(gs[r, :]); r += 1
+        im = ax.imshow(data.T, aspect='auto', origin='lower', cmap='hot',
+                       vmin=0, vmax=max(data.max(), 1e-6), interpolation='nearest')
+        ax.set_title(title, fontsize=8); ax.set_ylabel('chroma bin', fontsize=7)
+        ax.tick_params(labelsize=6)
+        plt.colorbar(im, ax=ax, fraction=0.02, pad=0.02)
 
+    heatmap_ax = fig.add_subplot(gs[r, :]); r += 1
     im_h = heatmap_ax.imshow(onset_pred_pitch.T, aspect='auto', origin='lower',
-                              cmap='hot', vmin=0, vmax=1.0, interpolation='nearest')
+                             cmap='hot', vmin=0, vmax=1.0, interpolation='nearest')
     plt.colorbar(im_h, ax=heatmap_ax, fraction=0.015, pad=0.01, label='onset probability')
     t_idx, f_idx = np.where(aligned_onsets_pitch)
     if len(t_idx) > 0:
@@ -162,6 +150,34 @@ def _visualize_diag(viz_dir, seg_key, onset_pred_pitch, aligned_onsets_pitch,
     heatmap_ax.set_xlabel('time frame', fontsize=8)
     heatmap_ax.set_ylabel(f'pitch index (0 = MIDI {MIN_MIDI})', fontsize=8)
     heatmap_ax.tick_params(labelsize=6)
+
+    if has_probs:
+        # Onset probability over time: gate + product as lines, with horizontal threshold lines
+        # and aligned-onset ticks (sharpness / timing / onset-vs-sustain).
+        ax_on = fig.add_subplot(gs[r, :]); r += 1
+        ax_on.plot(gate, color='tab:blue', lw=0.7,
+                   label=f'σ(onset) gate  (max {gate.max():.2f}, %>{onset_thr}={100*(gate>onset_thr).mean():.1f})')
+        ax_on.plot(prod, color='tab:orange', lw=0.7, alpha=0.85,
+                   label=f'product onset  (max {prod.max():.2f}, %>{prod_thr}={100*(prod>prod_thr).mean():.2f})')
+        ax_on.axhline(onset_thr, color='tab:blue', ls='--', lw=0.8)
+        ax_on.axhline(prod_thr, color='tab:orange', ls='--', lw=0.8)
+        if aligned_onset_t is not None and len(aligned_onset_t) > 0:
+            ax_on.scatter(aligned_onset_t, [onset_thr] * len(aligned_onset_t), marker='^',
+                          color='lime', s=20, zorder=5, label='aligned onset')
+        ax_on.set_ylim(0, 1); ax_on.set_xlim(0, len(gate))
+        ax_on.set_title('Onset probability over time (gate + product) + aligned onsets', fontsize=8)
+        ax_on.set_ylabel('probability', fontsize=7)
+        ax_on.legend(fontsize=6, loc='upper right'); ax_on.tick_params(labelsize=6)
+
+        # Offset probability over time + horizontal threshold line.
+        ax_off = fig.add_subplot(gs[r, :]); r += 1
+        ax_off.plot(offset, color='tab:green', lw=0.7,
+                    label=f'σ(offset)  (max {offset.max():.2f}, %>{offset_thr}={100*(offset>offset_thr).mean():.2f})')
+        ax_off.axhline(offset_thr, color='tab:green', ls='--', lw=0.8)
+        ax_off.set_ylim(0, 1); ax_off.set_xlim(0, len(offset))
+        ax_off.set_title('Offset probability over time', fontsize=8)
+        ax_off.set_xlabel('time frame', fontsize=8); ax_off.set_ylabel('probability', fontsize=7)
+        ax_off.legend(fontsize=6, loc='upper right'); ax_off.tick_params(labelsize=6)
 
     plt.tight_layout()
     out = os.path.join(viz_dir, f'{seg_key}_diag_{viz_tag}.png')
@@ -499,15 +515,12 @@ class EMDATASET(Dataset):
                         self.pts[flac] = _cached
                         _cache_valid = True
             if not _cache_valid:
-                if flac.count('#') != 2:
-                    print('two #', flac)
                 audio, sr = soundfile.read(flac, dtype='int16')
                 if len(audio.shape) == 2:
                     audio = audio.astype(float).mean(axis=1)
                 else:
                     audio = audio.astype(float)
                 audio = audio.astype(np.int16)
-                print('audio len', len(audio))
                 assert sr == SAMPLE_RATE
                 audio = torch.ShortTensor(audio)
                 if '#0' not in flac:
@@ -624,6 +637,32 @@ class EMDATASET(Dataset):
                         )
                         del _a_cu, _c_cu, _o, _f
                 torch.cuda.empty_cache()
+
+            # --- Aggregate onset-gate stats over ALL clips (the representative fade signal;
+            #     the 10 viz clips are only a sample). Recovered gate = max onset / max frame. ---
+            if _pred_cache:
+                _gmax, _gfrac = [], []
+                for _o, _f in _pred_cache.values():
+                    _on = _o.numpy()[:, -N_KEYS:].max(axis=1)
+                    _fr = _f.numpy()[:, -N_KEYS:].max(axis=1)
+                    _g = np.clip(_on / (_fr + 1e-9), 0.0, 1.0)
+                    _gmax.append(float(_g.max())); _gfrac.append(float((_g > 0.3).mean()))
+                _agg = {'onset_gate_mean_max': float(np.mean(_gmax)),
+                        'onset_gate_median_max': float(np.median(_gmax)),
+                        'onset_gate_mean_frac_gt_0.3': float(np.mean(_gfrac)),
+                        'n_clips': len(_gmax)}
+                print(f"[probs-aggregate] {viz_tag or 'epoch?'}: onset_gate "
+                      f"mean_max={_agg['onset_gate_mean_max']:.3f} "
+                      f"median_max={_agg['onset_gate_median_max']:.3f} "
+                      f"mean_frac>0.3={_agg['onset_gate_mean_frac_gt_0.3']:.4f} (n={_agg['n_clips']})")
+                if viz_dir is not None:
+                    try:
+                        _sp = os.path.join(os.path.dirname(viz_dir.rstrip('/')), 'probs_summary.json')
+                        _all = json.load(open(_sp)) if os.path.isfile(_sp) else {}
+                        _all[viz_tag or 'epoch?'] = _agg
+                        json.dump(_all, open(_sp, 'w'), indent=2)
+                    except Exception as _e:
+                        print(f'Warning: probs_summary write failed: {_e}')
         # ----------------------------------------------------------------------
 
         print('there are', len(self.pts), 'pts')
@@ -698,42 +737,32 @@ class EMDATASET(Dataset):
             # decoding, not by thresholding the dense product pianoroll.
             #   - onset timing from the sharp onset gate sigma(onset), recovered as
             #       gate[t] = max_k onset_pred[t] / max_k frame_pred[t]   (== sigmoid(onset_logit),
-            #       since onset_pred = sigma(onset)*pitchP and frame_pred = pitchP share argmax),
-            #     thresholded at a MEANINGFUL level (~0.5) instead of the product at 0.05.
+            #       since onset_pred = sigma(onset)*pitchP and frame_pred = pitchP share argmax).
             #   - pitch from argmax of the frame (pitch) posterior — one pitch per frame
             #     (correct for monophonic singing).
-            # onset_pred_np is already peak-picked (above), so nonzero frames are product peaks;
-            # we keep only those whose recovered onset-gate confidence clears the threshold ->
-            # one clean, pitch-resolved onset per real attack (far less over-production).
+            # onset_pred_np is already peak-picked above, so nonzero frames are product peaks;
+            # keep only those whose recovered gate confidence clears the threshold -> one
+            # clean, pitch-resolved onset per attack.
             if _is_adapter:
-                # threshold on the recovered onset gate; 0.3 lands near GT note counts
-                # (the gate is recovered via division so it runs lower than raw sigma(onset);
-                #  a proper logit-based decode via forward_logits is the clean follow-up).
-                _NATIVE_ONSET_THRESH = 0.3
-                _eps = 1e-6
-                _onset_max = onset_pred_np[:, -N_KEYS:].max(axis=1)        # (T,) peak-picked product onset
-                _pitch_max = frame_pred_np[:, -N_KEYS:].max(axis=1)        # (T,) pitchP
-                gate = np.clip(_onset_max / (_pitch_max + _eps), 0.0, 1.0) # ~ sigmoid(onset_logit)
-                gate[_onset_max < 0.02] = 0.0                              # drop numerically-unstable frames
-                pitch_arg = frame_pred_np[:, -N_KEYS:].argmax(axis=1)      # predicted key (0..N_KEYS-1)
-                _base = onset_pred_np.shape[1] - N_KEYS                    # pitch-only block offset (0 for adapter)
+                onset_gate_thresh = 0.3     # ~GT note counts (gate runs below raw sigma(onset))
+                eps = 1e-6
+                onset_max = onset_pred_np[:, -N_KEYS:].max(axis=1)        # (T,) peak-picked product onset
+                pitch_max = frame_pred_np[:, -N_KEYS:].max(axis=1)        # (T,) pitchP
+                gate = np.clip(onset_max / (pitch_max + eps), 0.0, 1.0)   # ~ sigmoid(onset_logit)
+                gate[onset_max < 0.02] = 0.0                              # drop numerically-unstable frames
+                pitch_arg = frame_pred_np[:, -N_KEYS:].argmax(axis=1)     # predicted key (0..N_KEYS-1)
+                base = onset_pred_np.shape[1] - N_KEYS                    # pitch-only block offset (0 for adapter)
                 onset_pred_for_dtw = np.zeros_like(onset_pred_np)
-                n_extracted = 0
                 for t in range(len(gate)):
-                    if gate[t] > _NATIVE_ONSET_THRESH:
-                        onset_pred_for_dtw[t, _base + pitch_arg[t]] = gate[t]
-                        n_extracted += 1
+                    if gate[t] > onset_gate_thresh:
+                        onset_pred_for_dtw[t, base + pitch_arg[t]] = gate[t]
                 onset_pred_np_for_dtw = onset_pred_for_dtw
-                print(f'adapter native-decode DTW events: {n_extracted} pred, '
-                      f'{int(unaligned_onsets[:, -N_KEYS:].any(axis=1).sum())} gt frames')
             else:
                 onset_pred_np_for_dtw = onset_pred_np
 
-            # Bag-of-notes distance (pitch only), computed AFTER note extraction.
-            # For the adapter the product onset caps ~0.3, so the old `>= 0.5` count was
-            # always zero -> BON was a GT-only constant (a dead metric), so BEST_BON never
-            # refined labels after epoch 1 and the EM loop was frozen. Count the extracted
-            # onset spikes (one per note) instead, so BON tracks the model and the loop turns.
+            # Bag-of-notes distance (pitch only), computed AFTER note extraction. For the adapter
+            # the product onset caps ~0.3, so count extracted onset spikes (one per note) rather
+            # than thresholding the product at >=0.5 (which is always zero -> a dead metric).
             if _is_adapter:
                 pred_bag_of_notes = (onset_pred_np_for_dtw[:, -N_KEYS:] > 0).sum(axis=0)
             else:
@@ -741,37 +770,29 @@ class EMDATASET(Dataset):
             gt_bag_of_notes = unaligned_onsets[:, -N_KEYS:].astype(bool).sum(axis=0)
             bon_dist = (((pred_bag_of_notes - gt_bag_of_notes) ** 2).sum()) ** 0.5
             bon_dist /= gt_bag_of_notes.sum()
-            print('bag of notes dist', bon_dist)
 
             # --- DTW feature (chroma: octave-independent, time-compressed to super-frames) ---
-            # Onset-only (default): align sharp onset chroma. Warps ONSET times well, but the path
-            # is unconstrained through silent gaps, so note offsets are not warped -> durations fall
-            # back to global proportional scaling (option 2 below).
-            # Duration DTW (DURATION_DTW=1): also append the frame/sustain chroma (note envelopes).
-            # A sustained note is a block whose RISING edge is the onset and FALLING edge is the
-            # offset; DTW aligns both edges, so the warp becomes duration-aware and offsets can be
-            # read straight off it (option 1 below). Onset chroma (sparse, ~1.0) still anchors the
-            # path; the sustain term (weighted _FW) fills the gaps and pins note ends.
-            _DURATION_DTW = _is_adapter and os.environ.get('DURATION_DTW', '0') == '1'
+            # Onset-only (default): align sharp onset chroma -> warps onset times; offsets are
+            # not warped and fall back to global proportional scaling (t_off_src2 below).
+            # Duration DTW (DURATION_DTW=1): also append the frame/sustain chroma so the warp
+            # aligns note ends too, and offsets can be read off it (t_off_src1 below). The
+            # sustain term is weighted by sustain_w relative to the onset term.
+            duration_dtw = _is_adapter and os.environ.get('DURATION_DTW', '0') == '1'
             onset_pred_comp = compress_time(compress_across_octave(onset_pred_np_for_dtw[:, -N_KEYS:]), DTW_FACTOR)
             onset_label_comp = compress_time(compress_across_octave(unaligned_onsets[:, -N_KEYS:]), DTW_FACTOR)
-            if _DURATION_DTW:
-                _FW = float(os.environ.get('DURATION_DTW_W', '0.5'))   # sustain weight relative to onset
-                _frame_pred_bin = (frame_pred_np[:, -N_KEYS:] > 0.1).astype(np.uint8)
-                frame_pred_comp = compress_time(compress_across_octave(_frame_pred_bin), DTW_FACTOR)
+            if duration_dtw:
+                sustain_w = float(os.environ.get('DURATION_DTW_W', '0.5'))   # sustain weight relative to onset
+                frame_pred_bin = (frame_pred_np[:, -N_KEYS:] > 0.1).astype(np.uint8)
+                frame_pred_comp = compress_time(compress_across_octave(frame_pred_bin), DTW_FACTOR)
                 frame_label_comp = compress_time(compress_across_octave(unaligned_frames[:, -N_KEYS:]), DTW_FACTOR)
-                _Tp = min(len(onset_pred_comp), len(frame_pred_comp))
-                _Tl = min(len(onset_label_comp), len(frame_label_comp))
-                pred_feat = np.concatenate([onset_pred_comp[:_Tp], _FW * frame_pred_comp[:_Tp]], axis=1)
-                label_feat = np.concatenate([onset_label_comp[:_Tl], _FW * frame_label_comp[:_Tl]], axis=1)
+                n_pred = min(len(onset_pred_comp), len(frame_pred_comp))
+                n_label = min(len(onset_label_comp), len(frame_label_comp))
+                pred_feat = np.concatenate([onset_pred_comp[:n_pred], sustain_w * frame_pred_comp[:n_pred]], axis=1)
+                label_feat = np.concatenate([onset_label_comp[:n_label], sustain_w * frame_label_comp[:n_label]], axis=1)
             else:
                 pred_feat, label_feat = onset_pred_comp, onset_label_comp
 
-            print('dtw lengths', len(pred_feat), len(label_feat), '(duration)' if _DURATION_DTW else '(onset-only)')
-            init_time = time.time()
             alignment = dtw(pred_feat, label_feat, dist_method='euclidean')
-            finish_time = time.time()
-            print('DTW took {} seconds.'.format(finish_time - init_time))
             index1, index2 = alignment.index1, alignment.index2
             matches1, matches2 = get_matches(index1, index2), get_matches(index2, index1)
 
@@ -822,8 +843,8 @@ class EMDATASET(Dataset):
                 except Exception:
                     t_off_src1 = t_off_src2
 
-                # A (DURATION_DTW off) uses option 2, byte-identical to before.
-                t_off_src = t_off_src1 if _DURATION_DTW else t_off_src2
+                # DURATION_DTW off -> use the global-scaled offset (t_off_src2).
+                t_off_src = t_off_src1 if duration_dtw else t_off_src2
                 aligned_frames[t_src: t_off_src, f] = 1
 
                 if t_off_src < len(aligned_offsets):
@@ -884,6 +905,46 @@ class EMDATASET(Dataset):
                             pred_notes.append((t_on / fps, len(pred_pitch) / fps, col + MIN_MIDI))
                     if seg_key not in self._notes_history:
                         self._notes_history[seg_key] = {}
+                    # --- RAW probability distributions (adapter): recompute native-head logits so
+                    #     the histograms show the un-peak-picked signal. Resize to the canonical
+                    #     length (onset_pred_np) so the time-series aligns with the aligned onsets.
+                    gate_np = prod_np = offs_np = None
+                    probs = None
+                    if _is_adapter:
+                        try:
+                            _dev = next(_inner.parameters()).device
+                            _a = (data['audio'].float() / 32768.).unsqueeze(0).to(_dev)
+                            _c = data.get('cqt')
+                            _c = _c.unsqueeze(0).to(_dev) if _c is not None else None
+                            with torch.no_grad():
+                                _ol, _ofl, _octl, _clsl = _inner.forward_logits(_a, _c)
+                                gate_np = torch.sigmoid(_ol)[0].cpu().numpy()
+                                offs_np = torch.sigmoid(_ofl)[0].cpu().numpy()
+                                _onpp, _frpp, _ofpp = _inner._per_pitch_probs(_ol[0], _ofl[0], _octl[0], _clsl[0])
+                                prod_np = _onpp.max(dim=1).values.cpu().numpy()
+                                nopitch_np = torch.softmax(_octl, -1)[0, :, 4].cpu().numpy()
+                            _T = onset_pred_np.shape[0]
+                            if len(gate_np) != _T:   # batched pad -> resize to canonical length
+                                _xs = np.linspace(0, 1, len(gate_np)); _xt = np.linspace(0, 1, _T)
+                                gate_np = np.interp(_xt, _xs, gate_np)
+                                prod_np = np.interp(_xt, _xs, prod_np)
+                                offs_np = np.interp(_xt, _xs, offs_np)
+                                nopitch_np = np.interp(_xt, _xs, nopitch_np)
+                            def _pstat(x, thr):
+                                return {'max': float(x.max()), 'p99': float(np.percentile(x, 99)),
+                                        'p50': float(np.percentile(x, 50)), 'mean': float(x.mean()),
+                                        f'frac_gt_{thr}': float((x > thr).mean())}
+                            probs = {
+                                'onset_gate': _pstat(gate_np, 0.3),
+                                'onset_prod': _pstat(prod_np, 0.05),
+                                'offset':     _pstat(offs_np, 0.5),
+                                'pitch': {'nopitch_mean': float(nopitch_np.mean())},
+                                'thresholds': {'onset_gate': 0.3, 'onset_prod': 0.05, 'offset': 0.5},
+                            }
+                        except Exception as _pe:
+                            print(f'Warning: probs viz failed for {flac}: {_pe}')
+                            gate_np = prod_np = offs_np = None
+
                     self._notes_history[seg_key][viz_tag] = {
                         'pred': pred_notes,
                         'gt': [(o, f, m) for o, f, m in gt_notes],
@@ -896,8 +957,10 @@ class EMDATASET(Dataset):
                             'n_label_events': int(unaligned_onsets[:, -N_KEYS:].any(axis=1).sum()),
                             'n_aligned_onsets': int(aligned_onsets[:, -N_KEYS:].sum()),
                         },
+                        'probs': probs,
                     }
                     _visualize_notes(viz_dir, seg_key, self._notes_history[seg_key])
+                    _aligned_onset_t = np.where(aligned_onsets[:, -N_KEYS:].any(axis=1))[0]
                     _visualize_diag(
                         viz_dir, seg_key,
                         onset_pred_np[:, -N_KEYS:],
@@ -907,6 +970,8 @@ class EMDATASET(Dataset):
                         pred_smooth=None,
                         label_raw=onset_label_comp,
                         label_smooth=None,
+                        gate=gate_np, prod=prod_np, offset=offs_np,
+                        aligned_onset_t=(_aligned_onset_t if gate_np is not None else None),
                     )
                     if notes_json_path is not None:
                         try:
@@ -989,175 +1054,3 @@ class EMDATASET(Dataset):
         # Restore the train/eval mode the model had on entry (see eval() above).
         if _restore_train:
             _inner.train()
-
-    '''
-        Update labels. Use only alignment without pseudo-labels.
-    '''
-
-    def update_pts_vanilla(self, transcriber,
-                   to_save=None, first=False, update=True):
-        print('Updating pts...')
-        if to_save is not None:
-            os.makedirs(to_save, exist_ok=True)
-        print('there are', len(self.pts), 'pts')
-        for flac, data in self.pts.items():
-            if 'unaligned_label' not in data:
-                continue
-            audio_inp = data['audio'].float() / 32768.
-            MAX_TIME = 5 * 60 * SAMPLE_RATE
-            audio_inp_len = len(audio_inp)
-            if audio_inp_len > MAX_TIME:
-                n_segments = 3 if audio_inp_len > 2 * MAX_TIME else 2
-                print('long audio, splitting to {} segments'.format(n_segments))
-                seg_len = audio_inp_len // n_segments
-                onsets_preds = []
-                offset_preds = []
-                frame_preds = []
-                vel_preds = []
-                for i_s in range(n_segments):
-                    curr = audio_inp[i_s * seg_len: (i_s + 1) * seg_len].unsqueeze(0).cuda()
-                    curr_mel = melspectrogram(curr.reshape(-1, curr.shape[-1])[:, :-1]).transpose(-1, -2)
-                    curr_onset_pred, curr_offset_pred, _, curr_frame_pred, curr_velocity_pred = transcriber(curr_mel)
-                    onsets_preds.append(curr_onset_pred)
-                    offset_preds.append(curr_offset_pred)
-                    frame_preds.append(curr_frame_pred)
-                    vel_preds.append(curr_velocity_pred)
-                onset_pred = torch.cat(onsets_preds, dim=1)
-                offset_pred = torch.cat(offset_preds, dim=1)
-                frame_pred = torch.cat(frame_preds, dim=1)
-                velocity_pred = torch.cat(vel_preds, dim=1)
-            else:
-                audio_inp = audio_inp.unsqueeze(0).cuda()
-                mel = melspectrogram(audio_inp.reshape(-1, audio_inp.shape[-1])[:, :-1]).transpose(-1, -2)
-                onset_pred, offset_pred, _, frame_pred, velocity_pred = transcriber(mel)
-            print('done predicting.')
-            # We assume onset predictions are of length N_KEYS * (len(instruments) + 1),
-            # first N_KEYS classes are the first instrument, next N_KEYS classes are the next instrument, etc.,
-            # and last N_KEYS classes are for pitch regardless of instrument
-            # Currently, frame and offset predictions are only N_KEYS classes.
-            onset_pred = onset_pred.detach().squeeze().cpu()
-            frame_pred = frame_pred.detach().squeeze().cpu()
-
-            peaks = get_peaks(onset_pred, 3)  # we only want local peaks, in a 7-frame neighborhood, 3 to each side.
-            onset_pred[~peaks] = 0
-
-            unaligned_onsets = (data['unaligned_label'] == 3).float().numpy()
-            unaligned_frames = (data['unaligned_label'] >= 2).float().numpy()
-
-            onset_pred_np = onset_pred.numpy()
-            frame_pred_np = frame_pred.numpy()
-
-            # We align based on likelihoods regardless of the octave (chroma features)
-            onset_pred_comp = compress_across_octave(onset_pred_np[:, -N_KEYS:])
-            onset_label_comp = compress_across_octave(unaligned_onsets[:, -N_KEYS:])
-            # We can do DTW on super-frames since anyway we search for local max afterwards
-            onset_pred_comp = compress_time(onset_pred_comp, DTW_FACTOR)
-            onset_label_comp = compress_time(onset_label_comp, DTW_FACTOR)
-            print('dtw lengths', len(onset_pred_comp), len(onset_label_comp))
-            init_time = time.time()
-            alignment = dtw(onset_pred_comp, onset_label_comp, dist_method='euclidean',
-                            )
-            finish_time = time.time()
-            print('DTW took {} seconds.'.format(finish_time - init_time))
-            index1, index2 = alignment.index1, alignment.index2
-            matches1, matches2 = get_matches(index1, index2), get_matches(index2, index1)
-
-            aligned_onsets = np.zeros(onset_pred_np.shape, dtype=bool)
-            aligned_frames = np.zeros(onset_pred_np.shape, dtype=bool)
-            aligned_offsets = np.zeros(onset_pred_np.shape, dtype=bool)
-
-            # We go over onsets (t, f) in the unaligned midi. For each onset, we find its approximate time based on DTW,
-            # then find its precise time with likelihood local max
-            for t, f in zip(*unaligned_onsets.nonzero()):
-                t_comp = t // DTW_FACTOR
-                t_src = matches2[t_comp]
-                t_sources = list(range(DTW_FACTOR * min(t_src), DTW_FACTOR * max(t_src) + 1))
-                # we extend the search area of local max to be ~0.5 second:
-                t_sources_extended = get_margin(t_sources, len(aligned_onsets))
-                # eliminate occupied positions. Allow only a single onset per 5 frames:
-                existing_eliminated = [t_source for t_source in t_sources_extended if (aligned_onsets[t_source - 2: t_source + 3, f] == 0).all()]
-                if len(existing_eliminated) > 0:
-                    t_sources_extended = existing_eliminated
-
-                t_src = max(t_sources_extended, key=lambda x: onset_pred_np[x, f])  # t_src is the most likely time in the local neighborhood for this note onset
-                f_pitch = (len(self.instruments) * N_KEYS) + (f % N_KEYS)
-                aligned_onsets[t_src, f] = 1  # set the label
-                # Now we need to decide note duration and offset time. Find note length in unaligned midi:
-                t_off = t
-                while t_off < len(unaligned_frames) and unaligned_frames[t_off, f]:
-                    t_off += 1
-                note_len = t_off - t  # this is the note length in the unaligned midi. We need note length in the audio.
-
-                # option 1: use mapping, traverse note length in the unaligned midi, and then use the reverse mapping:
-                try:
-                    t_off_src1 = max(matches2[(DTW_FACTOR * max(matches1[t_src // DTW_FACTOR]) + note_len) // DTW_FACTOR]) * DTW_FACTOR
-                    t_off_src1 = max(t_src + 1, t_off_src1)
-                except Exception as e:
-                    t_off_src1 = len(aligned_offsets)
-                # option 2: use relative note length
-                t_off_src2 = t_src + int(note_len * (len(aligned_onsets) / len(unaligned_onsets)))
-                t_off_src2 = min(len(aligned_onsets), t_off_src2)
-
-                t_off_src = t_off_src2  # we choose option 2
-                aligned_frames[t_src: t_off_src, f] = 1
-
-                if t_off_src < len(aligned_offsets):
-                    aligned_offsets[t_off_src, f] = 1
-
-            # eliminate instruments that do not exist in the unaligned midi
-            inactive_instruments, active_instruments_list = get_inactive_instruments(unaligned_onsets, len(aligned_onsets))
-            onset_pred_np[inactive_instruments] = 0
-
-            onset_label = aligned_onsets
-            frame_label = aligned_frames
-            offset_label = aligned_offsets
-            label = np.maximum(2 * frame_label, offset_label)
-            label = np.maximum(3 * onset_label, label).astype(np.uint8)
-
-            if to_save is not None:
-                inst_only = len(self.instruments) * N_KEYS
-                time_now = datetime.now().strftime('%y%m%d-%H%M%S')
-                frames2midi(to_save + '/' + data['path'].replace('.flac', '').split('/')[-1] + '_alignment_' + time_now + '.mid',
-                            aligned_onsets[:, : inst_only], aligned_frames[:, : inst_only],
-                            64. * aligned_onsets[:, : inst_only],
-                            inst_mapping=self.instruments)
-                frames2midi_pitch(to_save + '/' + data['path'].replace('.flac', '').split('/')[-1] + '_alignment_pitch_' + time_now + '.mid',
-                                  aligned_onsets[:, -N_KEYS:], aligned_frames[:, -N_KEYS:],
-                                  64. * aligned_onsets[:, -N_KEYS:])
-                predicted_onsets = onset_pred_np >= 0.5
-                predicted_frames = frame_pred_np >= 0.5
-                frames2midi(to_save + '/' + data['path'].replace('.flac', '').split('/')[-1] + '_pred_' + time_now + '.mid',
-                            predicted_onsets[:, : inst_only], predicted_frames[:, : inst_only],
-                            64. * predicted_onsets[:, : inst_only],
-                            inst_mapping=self.instruments)
-                frames2midi_pitch(to_save + '/' + data['path'].replace('.flac', '').split('/')[-1] + '_pred_pitch_' + time_now + '.mid',
-                                  predicted_onsets[:, -N_KEYS:], predicted_frames[:, -N_KEYS:],
-                                  64. * predicted_onsets[:, -N_KEYS:])
-                if len(self.instruments) > 1:
-                    max_pred_onsets = max_inst(onset_pred_np)
-                    frames2midi(to_save + '/' + data['path'].replace('.flac', '').split('/')[-1] + '_pred_max_' + time_now + '.mid',
-                                max_pred_onsets[:, : inst_only], predicted_frames[:, : inst_only],
-                                64. * max_pred_onsets[:, : inst_only],
-                                inst_mapping=self.instruments)
-            if update:
-                data['label'] = torch.from_numpy(label).byte()
-
-            velocity_pred = velocity_pred.detach().squeeze().cpu()
-            # velocity_pred = torch.from_numpy(new_vels)
-            velocity_pred = (128. * velocity_pred)
-            velocity_pred[velocity_pred < 0.] = 0.
-            velocity_pred[velocity_pred > 127.] = 127.
-            velocity_pred = velocity_pred.byte()
-            if update:
-                data['velocity'] = velocity_pred
-
-            del audio_inp
-            try:
-                del mel
-            except:
-                pass
-            del onset_pred
-            del offset_pred
-            del frame_pred
-            del velocity_pred
-            torch.cuda.empty_cache()
