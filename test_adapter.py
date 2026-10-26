@@ -41,7 +41,7 @@ AUDIO_DIR          = '/data/hakka/mynoteem_new/data/mirst500_15sec_data_full_qua
 ZS_MODEL_PATH      = '/data/hakka/singing_transcription_ICASSP2021/AST/models/1005_e_4'
 ZS_CACHE_JSON      = '/data/hakka/mynoteem_new/test_zeroshot/mirst_zeroshot_results.json'
 GT_JSON            = '/data/hakka/singing_transcription_ICASSP2021/MIR-ST500_20210206/MIR-ST500_corrected.json'
-EPOCH = 3
+EPOCH = int(os.environ.get('EPOCH', 15))
 
 run_dir = os.environ.get('RUN_DIR', 'transcriber-261018-155033-adapter_True')
 ADAPTER_MODEL_PATH = os.environ.get(

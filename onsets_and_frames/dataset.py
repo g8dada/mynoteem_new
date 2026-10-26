@@ -98,18 +98,27 @@ def _visualize_diag(viz_dir, seg_key, onset_pred_pitch, aligned_onsets_pitch,
                     pred_raw=None, pred_smooth=None,
                     label_raw=None, label_smooth=None,
                     gate=None, prod=None, offset=None, aligned_onset_t=None,
-                    onset_thr=0.3, prod_thr=0.05, offset_thr=0.5):
+                    onset_thr=0.3, prod_thr=0.05, offset_thr=0.5,
+                    sus=None, sus_pred_chroma=None, sus_gt_chroma=None,
+                    aligned_offset_t=None, sus_thr=0.1):
     """
     Diagnostic figure saved as {seg_key}_diag_{viz_tag}.png.
     Top: chroma panels (pred / GT) + onset-probability heatmap with aligned onsets.
     When gate/prod/offset arrays are supplied (adapter), also adds:
-      - onset-probability histogram: sigma(onset) gate (thr onset_thr) + product onset (thr prod_thr), log-y
-      - offset-probability histogram: sigma(offset) (thr offset_thr), log-y
-      - sigma(onset) time-series with the threshold line + aligned-onset ticks (sharpness/timing)
+      - sigma(onset) time-series (gate + product) with threshold lines + aligned-onset ticks
+      - sigma(offset) time-series with the threshold line
+    When sus (sustain/voicing) arrays are supplied (duration-DTW diagnostic), also adds:
+      - sustain max-P(pitch) time-series with the DTW binarization threshold (sus_thr) and
+        aligned onset (^) / offset (v) ticks -> does voicing DROP between notes (clean falling
+        edges = usable offset info) or stay ~on (no offsets for any method to find)?
+      - pred vs GT sustain chroma side-by-side in the compressed/binarized space the duration-DTW
+        warp actually consumes -> block-structure mismatch is why the shared warp corrupts onset.
     """
     os.makedirs(viz_dir, exist_ok=True)
     is_adapter_viz = pred_smooth is not None
     has_probs = gate is not None
+    has_sus = sus is not None
+    has_sus_chroma = sus_pred_chroma is not None and sus_gt_chroma is not None
     bon_str = f'  |  BON dist: {bon_dist:.4f}' if bon_dist is not None else ''
 
     if is_adapter_viz:
@@ -123,7 +132,11 @@ def _visualize_diag(viz_dir, seg_key, onset_pred_pitch, aligned_onsets_pitch,
 
     heights = [1] * len(chroma) + [2]          # chroma rows + heatmap
     if has_probs:
-        heights += [1.2, 1.2]                  # histogram row + time-series row
+        heights += [1.2, 1.2]                  # onset time-series + offset time-series
+    if has_sus:
+        heights += [1.2]                       # sustain (voicing) time-series
+        if has_sus_chroma:
+            heights += [1.4]                   # pred vs GT sustain chroma pair
     fig = plt.figure(figsize=(14, max(9, sum(heights) * 1.4)))
     gs = fig.add_gridspec(len(heights), 2, height_ratios=heights)
     fig.suptitle(f'{seg_key} — {viz_tag}{bon_str}', fontsize=10, fontweight='bold')
@@ -178,6 +191,39 @@ def _visualize_diag(viz_dir, seg_key, onset_pred_pitch, aligned_onsets_pitch,
         ax_off.set_title('Offset probability over time', fontsize=8)
         ax_off.set_xlabel('time frame', fontsize=8); ax_off.set_ylabel('probability', fontsize=7)
         ax_off.legend(fontsize=6, loc='upper right'); ax_off.tick_params(labelsize=6)
+
+    if has_sus:
+        # Sustain (voicing) over time with the duration-DTW binarization threshold, plus aligned
+        # onsets (^) and offsets (v). Offset-info diagnostic: if voicing stays above sus_thr across
+        # note boundaries (no falling edges), the sustain carries no offset information and the
+        # duration-DTW warp has nothing to pin note ends to.
+        ax_sus = fig.add_subplot(gs[r, :]); r += 1
+        ax_sus.plot(sus, color='tab:purple', lw=0.7,
+                    label=f'sustain max P(pitch)  (max {sus.max():.2f}, %>{sus_thr}={100*(sus>sus_thr).mean():.1f})')
+        ax_sus.axhline(sus_thr, color='tab:purple', ls='--', lw=0.8, label=f'DTW binarize thr {sus_thr}')
+        if aligned_onset_t is not None and len(aligned_onset_t) > 0:
+            ax_sus.scatter(aligned_onset_t, [sus_thr] * len(aligned_onset_t), marker='^',
+                           color='lime', s=20, zorder=5, label='aligned onset')
+        if aligned_offset_t is not None and len(aligned_offset_t) > 0:
+            ax_sus.scatter(aligned_offset_t, [sus_thr] * len(aligned_offset_t), marker='v',
+                           color='red', s=20, zorder=5, label='aligned offset')
+        ax_sus.set_ylim(0, 1); ax_sus.set_xlim(0, len(sus))
+        ax_sus.set_title('Sustain (voicing) over time + aligned onsets/offsets — offset-info diagnostic', fontsize=8)
+        ax_sus.set_ylabel('probability', fontsize=7); ax_sus.tick_params(labelsize=6)
+        ax_sus.legend(fontsize=6, loc='upper right')
+
+        if has_sus_chroma:
+            # The sustain chroma the duration-DTW warp actually consumes: pred vs GT, side by side.
+            # Matching block structure (rising=onset, falling=offset) -> warp can read offsets;
+            # mismatch / no gaps -> the shared warp is corrupted and onset alignment degrades.
+            ax_sp = fig.add_subplot(gs[r, 0]); ax_sg = fig.add_subplot(gs[r, 1]); r += 1
+            for ax, d, title in [(ax_sp, sus_pred_chroma, 'Pred sustain chroma (duration-DTW feat)'),
+                                 (ax_sg, sus_gt_chroma, 'GT sustain chroma (duration-DTW feat)')]:
+                im = ax.imshow(d.T, aspect='auto', origin='lower', cmap='hot',
+                               vmin=0, vmax=max(d.max(), 1e-6), interpolation='nearest')
+                ax.set_title(title, fontsize=8); ax.set_ylabel('chroma bin', fontsize=7)
+                ax.set_xlabel('compressed time', fontsize=7); ax.tick_params(labelsize=6)
+                plt.colorbar(im, ax=ax, fraction=0.02, pad=0.02)
 
     plt.tight_layout()
     out = os.path.join(viz_dir, f'{seg_key}_diag_{viz_tag}.png')
@@ -608,7 +654,8 @@ class EMDATASET(Dataset):
                     # audio is ignored inside forward() when CQT is provided,
                     # so pad to a common length to satisfy torch.stack.
                     _audios = [d['audio'].float() / 32768. for _, d in _batch]
-                    _max_alen = max(a.shape[0] for a in _audios)
+                    _alens = [a.shape[0] for a in _audios]
+                    _max_alen = max(_alens)
                     _batch_audio = torch.stack(
                         [torch.nn.functional.pad(a, (0, _max_alen - a.shape[0]))
                          for a in _audios]
@@ -617,11 +664,15 @@ class EMDATASET(Dataset):
                         d['cqt'].cuda() if d.get('cqt') is not None else None
                         for _, d in _batch
                     ]
-                    _o_all, _, _, _f_all, _ = _inner(_batch_audio, cqt=_cqt_list)
+                    # Pass real per-clip lengths so each clip is interpolated to its OWN mel length;
+                    # padding to _max_alen above is only for stacking. Without clip_lengths the
+                    # shorter clips would be time-stretched to the padded length -> labels land late.
+                    _o_all, _, _, _f_all, _ = _inner(_batch_audio, cqt=_cqt_list, clip_lengths=_alens)
                     _o_all = _o_all.detach().cpu()
                     _f_all = _f_all.detach().cpu()
                     for _j, (_flac, _) in enumerate(_batch):
-                        _pred_cache[_flac] = (_o_all[_j], _f_all[_j])
+                        _tmel_j = max(1, (_alens[_j] - 1) // HOP_LENGTH + 1)
+                        _pred_cache[_flac] = (_o_all[_j][:_tmel_j], _f_all[_j][:_tmel_j])
                     del _batch_audio, _o_all, _f_all
                 except Exception as _exc:
                     print(f'Batch inference failed ({_exc}), falling back per-clip')
@@ -908,7 +959,7 @@ class EMDATASET(Dataset):
                     # --- RAW probability distributions (adapter): recompute native-head logits so
                     #     the histograms show the un-peak-picked signal. Resize to the canonical
                     #     length (onset_pred_np) so the time-series aligns with the aligned onsets.
-                    gate_np = prod_np = offs_np = None
+                    gate_np = prod_np = offs_np = sus_np = None
                     probs = None
                     if _is_adapter:
                         try:
@@ -922,6 +973,7 @@ class EMDATASET(Dataset):
                                 offs_np = torch.sigmoid(_ofl)[0].cpu().numpy()
                                 _onpp, _frpp, _ofpp = _inner._per_pitch_probs(_ol[0], _ofl[0], _octl[0], _clsl[0])
                                 prod_np = _onpp.max(dim=1).values.cpu().numpy()
+                                sus_np = _frpp.max(dim=1).values.cpu().numpy()   # voicing / sustain proxy
                                 nopitch_np = torch.softmax(_octl, -1)[0, :, 4].cpu().numpy()
                             _T = onset_pred_np.shape[0]
                             if len(gate_np) != _T:   # batched pad -> resize to canonical length
@@ -929,6 +981,7 @@ class EMDATASET(Dataset):
                                 gate_np = np.interp(_xt, _xs, gate_np)
                                 prod_np = np.interp(_xt, _xs, prod_np)
                                 offs_np = np.interp(_xt, _xs, offs_np)
+                                sus_np = np.interp(_xt, _xs, sus_np)
                                 nopitch_np = np.interp(_xt, _xs, nopitch_np)
                             def _pstat(x, thr):
                                 return {'max': float(x.max()), 'p99': float(np.percentile(x, 99)),
@@ -943,7 +996,7 @@ class EMDATASET(Dataset):
                             }
                         except Exception as _pe:
                             print(f'Warning: probs viz failed for {flac}: {_pe}')
-                            gate_np = prod_np = offs_np = None
+                            gate_np = prod_np = offs_np = sus_np = None
 
                     self._notes_history[seg_key][viz_tag] = {
                         'pred': pred_notes,
@@ -972,6 +1025,12 @@ class EMDATASET(Dataset):
                         label_smooth=None,
                         gate=gate_np, prod=prod_np, offset=offs_np,
                         aligned_onset_t=(_aligned_onset_t if gate_np is not None else None),
+                        sus=sus_np,
+                        sus_pred_chroma=compress_time(compress_across_octave(
+                            (frame_pred_np[:, -N_KEYS:] > 0.1).astype(np.uint8)), DTW_FACTOR),
+                        sus_gt_chroma=compress_time(compress_across_octave(
+                            unaligned_frames[:, -N_KEYS:]), DTW_FACTOR),
+                        aligned_offset_t=np.where(aligned_offsets[:, -N_KEYS:].any(axis=1))[0],
                     )
                     if notes_json_path is not None:
                         try:

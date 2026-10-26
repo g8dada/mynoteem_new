@@ -338,7 +338,7 @@ class AMTAdapter(nn.Module):
     # Public interface
     # ------------------------------------------------------------------
 
-    def forward(self, audio, cqt=None):
+    def forward(self, audio, cqt=None, clip_lengths=None):
         """Run the adapter forward pass.
 
         audio : (B, L) or (L,) float tensor at 16 kHz, range [-1, 1]
@@ -361,7 +361,17 @@ class AMTAdapter(nn.Module):
         if audio.dim() == 1:
             audio = audio.unsqueeze(0)
         B, L = audio.shape
-        T_mel = (L - 1) // HOP_LENGTH + 1
+
+        # Per-clip output length. The batched E-step pads audio to a common length only to satisfy
+        # torch.stack (the real per-clip CQT is passed separately, and padded audio is ignored when
+        # cqt is given). Each clip must be interpolated to ITS OWN real mel length — otherwise a
+        # short clip's features get stretched across the padded timeline and its events shift late.
+        # clip_lengths = real per-clip audio sample counts; without it we use the single length L
+        # (correct for the unpadded single-clip path, which is every other caller).
+        if clip_lengths is not None:
+            t_mels = [max(1, (int(cl) - 1) // HOP_LENGTH + 1) for cl in clip_lengths]
+        else:
+            t_mels = [(L - 1) // HOP_LENGTH + 1] * B
 
         # Normalise cqt into a per-clip list regardless of how it was passed.
         if isinstance(cqt, (list, tuple)):
@@ -394,27 +404,34 @@ class AMTAdapter(nn.Module):
         oct_all = torch.cat(oct_chunks)  # (sum_T_cqt, 5)
         cls_all = torch.cat(cls_chunks)  # (sum_T_cqt, 13)
 
-        def _interp(x):
+        def _interp(x, size):
             return F.interpolate(
-                x.T.unsqueeze(0), size=T_mel, mode='linear', align_corners=False
-            ).squeeze(0).T  # (T_mel, N_KEYS)
+                x.T.unsqueeze(0), size=size, mode='linear', align_corners=False
+            ).squeeze(0).T  # (size, N_KEYS)
 
         onset_list, frame_list, offset_list = [], [], []
         start = 0
-        for t_cqt in clip_t_cqts:
+        for b_idx, t_cqt in enumerate(clip_t_cqts):
             end = start + t_cqt
             onset_pp, frame_pp, offset_pp = self._per_pitch_probs(
                 o_all[start:end], of_all[start:end],
                 oct_all[start:end], cls_all[start:end],
             )
-            onset_list.append(_interp(onset_pp))
-            frame_list.append(_interp(frame_pp))
-            offset_list.append(_interp(offset_pp))
+            tm = t_mels[b_idx]
+            onset_list.append(_interp(onset_pp, tm))
+            frame_list.append(_interp(frame_pp, tm))
+            offset_list.append(_interp(offset_pp, tm))
             start = end
 
-        onset_pred  = torch.stack(onset_list)   # (B, T_mel, N_KEYS)
-        frame_pred  = torch.stack(frame_list)
-        offset_pred = torch.stack(offset_list)
+        # Clips may now have different T_mel; pad each to the batch max with zeros at the END
+        # (preserving real-time event positions) so they can be stacked. Callers that passed
+        # clip_lengths crop each clip back to its real length t_mels[b].
+        t_mel_max = max(t_mels)
+        def _pad_tail(x):
+            return x if x.shape[0] == t_mel_max else F.pad(x, (0, 0, 0, t_mel_max - x.shape[0]))
+        onset_pred  = torch.stack([_pad_tail(x) for x in onset_list])   # (B, t_mel_max, N_KEYS)
+        frame_pred  = torch.stack([_pad_tail(x) for x in frame_list])
+        offset_pred = torch.stack([_pad_tail(x) for x in offset_list])
         velocity_pred = torch.zeros_like(onset_pred)
 
         return onset_pred, offset_pred, frame_pred, frame_pred, velocity_pred
